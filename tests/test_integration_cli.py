@@ -138,12 +138,21 @@ class CliIntegration(unittest.TestCase):
         r = self.run_cli("list", "--json", "--no-aggregate", "--days", "100000")
         self.assertEqual(json.loads(r.stdout)["count"], 2)
 
+    def test_sources_prints_zero_for_an_empty_calendar(self):
+        with (self.profile / "prefs.js").open("a") as fh:
+            fh.write('user_pref("calendar.registry.uuid-empty.name", "Leer");\n'
+                     'user_pref("calendar.registry.uuid-empty.type", "caldav");\n')
+        out = self.run_cli("sources").stdout
+        self.assertIn("0 events", out)
+        self.assertNotIn("- events", out)
+
     def test_count_flag(self):
         self.assertEqual(self.run_cli("list", "--count", "--days", "100000").stdout.strip(), "2")
 
     def test_no_profile_errors(self):
         r = subprocess.run([sys.executable, str(CLI), "--profile", "/nonexistent/x",
-                            "sources"], capture_output=True, text=True)
+                            "--config", str(self.config), "sources"],
+                           capture_output=True, text=True)
         self.assertEqual(r.returncode, 1)
 
     def test_theme_from_fixture(self):

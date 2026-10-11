@@ -35,6 +35,7 @@ detached exception (a second row sharing the master id with a non-null
 """
 
 import argparse
+import base64
 import calendar
 import datetime
 import json
@@ -45,6 +46,9 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import urllib.error
+import urllib.request
+import xml.etree.ElementTree as ET
 
 PLUGIN_DIR = pathlib.Path(__file__).resolve().parent.parent
 USECS_PER_SECOND = 1000000
@@ -58,6 +62,22 @@ DEFAULT_CALENDAR = "Home"
 # Thunderbird, so the copy stays in its own schema.
 ITEM_TABLES = ("cal_events", "cal_properties", "cal_recurrence", "cal_alarms",
                "cal_attendees", "cal_relations", "cal_attachments")
+
+# A Nextcloud (or any CalDAV) calendar is a read source alongside the Thunderbird
+# stores: it is fetched over WebDAV and merged into the same view.
+DAV_NS = "{DAV:}"
+NC_PREFIX = "nc:"
+CALENDAR_PROPFIND = """<?xml version="1.0" encoding="utf-8"?>
+<d:propfind xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
+  <d:prop><d:displayname/><d:resourcetype/></d:prop>
+</d:propfind>"""
+CALENDAR_QUERY = """<?xml version="1.0" encoding="utf-8"?>
+<c:calendar-query xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
+  <d:prop><c:calendar-data/></d:prop>
+  <c:filter><c:comp-filter name="VCALENDAR"><c:comp-filter name="VEVENT">
+    <c:time-range start="%s" end="%s"/>
+  </c:comp-filter></c:comp-filter></c:filter>
+</c:calendar-query>"""
 
 USER_CONFIG = "omarchy-calendar/calendar.json"
 # The applied theme's palette — a *copy*, so the directory is always 'theme' and the
@@ -756,6 +776,264 @@ def store_of(calendars, cal_id):
     return None
 
 
+# ── Nextcloud / CalDAV (read source) ──────────────────────────────────────────
+
+def nc_secret(nc):
+    """The DAV password for a Nextcloud config block, or "".
+
+    `password_command` is run (shell) and its stdout used; with `encoding: base64`
+    the output is base64-decoded — which is how the Nextcloud desktop client stores
+    its app password in the freedesktop keyring (`secret-tool lookup server
+    Nextcloud ...`).
+    """
+    if nc.get("password"):
+        return nc["password"]
+    cmd = nc.get("password_command")
+    if not cmd:
+        return ""
+    try:
+        out = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    if out.returncode != 0:
+        return ""
+    secret = out.stdout.strip()
+    if nc.get("encoding") == "base64":
+        try:
+            secret = base64.b64decode(secret).decode()
+        except (ValueError, UnicodeDecodeError):
+            return ""
+    return secret
+
+
+def dav_request(method, url, user, password, body=None, depth=None, timeout=20):
+    """One DAV request -> (status, text). A failure to connect is status 0.
+
+    Tests replace this function, so no unit test touches the network.
+    """
+    data = body.encode() if body is not None else None
+    req = urllib.request.Request(url, data=data, method=method)
+    if user is not None:
+        token = base64.b64encode(("%s:%s" % (user, password)).encode()).decode()
+        req.add_header("Authorization", "Basic " + token)
+    if data is not None:
+        req.add_header("Content-Type", "application/xml; charset=utf-8")
+    if depth is not None:
+        req.add_header("Depth", str(depth))
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status, resp.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as exc:
+        return exc.code, exc.read().decode("utf-8", "replace")
+    except (urllib.error.URLError, OSError):
+        return 0, ""
+
+
+def dav_responses(xml_text):
+    """[(href, props)] from a DAV multistatus body. props carries displayname and
+    an _is_calendar flag; an unparsable body yields []."""
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError:
+        return []
+    out = []
+    for resp in root.findall(DAV_NS + "response"):
+        href_el = resp.find(DAV_NS + "href")
+        href = (href_el.text or "").strip() if href_el is not None else ""
+        dn_el = resp.find(DAV_NS + "propstat/" + DAV_NS + "prop/" + DAV_NS + "displayname")
+        props = {"displayname": (dn_el.text or "").strip() if dn_el is not None else ""}
+        props["_is_calendar"] = any(el.tag.endswith("}calendar") for el in resp.iter())
+        out.append((href, props))
+    return out
+
+
+def nextcloud_calendars(config, request=dav_request, password=None):
+    """[entry] for every CalDAV calendar the account exposes, or []."""
+    nc = config.get("nextcloud")
+    if not nc or not nc.get("base_url") or not nc.get("principal"):
+        return []
+    pw = nc_secret(nc) if password is None else password
+    if not pw:
+        return []
+    url = "%s/remote.php/dav/calendars/%s/" % (nc["base_url"].rstrip("/"), nc["principal"])
+    status, body = request("PROPFIND", url, nc.get("user"), pw, body=CALENDAR_PROPFIND, depth=1)
+    if status not in (200, 207):
+        return []
+    cals = []
+    for href, props in dav_responses(body):
+        if not props["_is_calendar"]:
+            continue
+        slug = href.rstrip("/").rsplit("/", 1)[-1]
+        cals.append({"id": NC_PREFIX + slug, "name": props["displayname"] or slug,
+                     "type": "caldav", "uri": href, "disabled": False, "store": None,
+                     "count": -1, "source": "nextcloud"})
+    return sorted(cals, key=lambda c: c["name"].lower())
+
+
+def unfold_ics(text):
+    """Undo RFC 5545 folding (a continuation line starts with space or tab)."""
+    return re.sub(r"\r?\n[ \t]", "", text or "")
+
+
+def parse_ics_events(text):
+    """[{property: [(value, [params])]}] — one entry per VEVENT block."""
+    events, current = [], None
+    for line in unfold_ics(text).splitlines():
+        line = line.strip()
+        if line == "BEGIN:VEVENT":
+            current = {}
+            continue
+        if line == "END:VEVENT":
+            if current is not None:
+                events.append(current)
+            current = None
+            continue
+        if current is None or ":" not in line:
+            continue
+        key, _, value = line.partition(":")
+        parts = key.split(";")
+        current.setdefault(parts[0].upper(), []).append((value, parts[1:]))
+    return events
+
+
+def _param(params, name):
+    for p in params:
+        if p.upper().startswith(name + "="):
+            return p.split("=", 1)[1]
+    return None
+
+
+def ics_datetime(value, params=()):
+    """(naive-local datetime, all_day, floating) for a DTSTART/DTEND value, or None.
+
+    A bare date is all-day; a UTC value (…Z) is converted to local time; a TZID value
+    is converted when that zone is known, and a zoned/floating value is otherwise read
+    as local wall clock (matching how Thunderbird stores floating events).
+    """
+    value = value.strip()
+    if not value:
+        return None
+    if re.fullmatch(r"\d{8}", value):
+        d = datetime.datetime.strptime(value, "%Y%m%d")
+        return d, True, True
+    m = re.fullmatch(r"(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})(Z?)", value)
+    if not m:
+        return None
+    y, mo, d, h, mi, s, zulu = m.groups()
+    naive = datetime.datetime(int(y), int(mo), int(d), int(h), int(mi), int(s))
+    if zulu:
+        return _utc_to_local(naive), False, False
+    tzid = _param(params, "TZID")
+    if tzid:
+        try:
+            import zoneinfo
+            aware = naive.replace(tzinfo=zoneinfo.ZoneInfo(tzid))
+            return aware.astimezone().replace(tzinfo=None), False, False
+        except (ImportError, KeyError, ValueError):
+            return naive, False, True
+    return naive, False, True
+
+
+def _ics_usecs(moment, allday):
+    if allday:
+        aware = moment.replace(tzinfo=datetime.timezone.utc)
+        return int(aware.timestamp()) * USECS_PER_SECOND
+    return int(moment.timestamp()) * USECS_PER_SECOND
+
+
+def nextcloud_events(cal, config, request=dav_request, now=None, days=7, password=None):
+    """Upcoming events from one CalDAV calendar, in the Thunderbird-store shape."""
+    nc = config.get("nextcloud")
+    if not nc:
+        return []
+    pw = nc_secret(nc) if password is None else password
+    if not pw:
+        return []
+    now = now or datetime.datetime.now()
+    start = (now - datetime.timedelta(days=1)).strftime("%Y%m%dT%H%M%SZ")
+    end = (now + datetime.timedelta(days=days)).strftime("%Y%m%dT%H%M%SZ")
+    url = nc["base_url"].rstrip("/") + cal["uri"]
+    status, body = request("REPORT", url, nc.get("user"), pw,
+                           body=CALENDAR_QUERY % (start, end), depth=1)
+    if status not in (200, 207):
+        return []
+    events = []
+    # the namespace prefix is server-chosen (Nextcloud/Sabre uses <cal:calendar-data>),
+    # so match it prefix-agnostically rather than assuming "c:".
+    for data in re.findall(r"<(?:[\w.-]+:)?calendar-data[^>]*>(.*?)</(?:[\w.-]+:)?calendar-data>",
+                           body, re.S):
+        events.extend(_events_from_ics(data, cal["id"]))
+    return events
+
+
+def _events_from_ics(data, cal_id):
+    """VEVENT blocks -> event dicts (master rows plus detached exceptions)."""
+    masters, exceptions = {}, []
+    for props in parse_ics_events(data):
+        uid = props.get("UID", [("", [])])[0][0]
+        if not uid:
+            continue
+        start = ics_datetime(*props["DTSTART"][0]) if props.get("DTSTART") else None
+        if start is None:
+            continue
+        start_dt, allday, floating = start
+        if props.get("DTEND"):
+            end_dt, _, _ = ics_datetime(*props["DTEND"][0])
+        elif props.get("DURATION"):
+            end_dt = start_dt + _parse_duration(props["DURATION"][0][0])
+        else:
+            end_dt = start_dt + datetime.timedelta(days=1) if allday else start_dt
+        event = {
+            "id": uid,
+            "calendar": cal_id,
+            "title": props.get("SUMMARY", [("(no title)", [])])[0][0] or "(no title)",
+            "status": props.get("STATUS", [("", [])])[0][0],
+            "allday": allday,
+            "floating": floating,
+            "start_usecs": _ics_usecs(start_dt, allday),
+            "end_usecs": _ics_usecs(end_dt, allday),
+            "rule": None,
+            "exdate": set(),
+            "rdate": [],
+            "exceptions": set(),
+        }
+        if props.get("RRULE"):
+            event["rule"] = parse_rrule("RRULE:" + props["RRULE"][0][0])
+        for raw, params in props.get("EXDATE", []):
+            for part in raw.split(","):
+                parsed = ics_datetime(part.strip(), params)
+                if parsed:
+                    event["exdate"].add(int(_ics_usecs(parsed[0], parsed[1]) / USECS_PER_SECOND))
+        for raw, params in props.get("RDATE", []):
+            parsed = ics_datetime(raw.strip(), params)
+            if parsed:
+                event["rdate"].append(parsed[0])
+        if props.get("RECURRENCE-ID"):
+            recid = ics_datetime(*props["RECURRENCE-ID"][0])
+            if recid:
+                event["override_of"] = _ics_usecs(recid[0], recid[1])
+                exceptions.append(event)
+                continue
+        masters[uid] = event
+    for exc in exceptions:
+        master = masters.get(exc["id"])
+        if master is not None:
+            master["exceptions"].add(exc["override_of"] // USECS_PER_SECOND)
+    return list(masters.values()) + exceptions
+
+
+def _parse_duration(value):
+    """A (subset of) RFC 5545 DURATION -> timedelta."""
+    m = re.fullmatch(r"([+-])?P(?:(\d+)W)?(?:(\d+)D)?(?:T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?)?",
+                     value.strip().upper())
+    if not m:
+        return datetime.timedelta(0)
+    sign, w, d, h, mi, s = m.groups()
+    delta = datetime.timedelta(weeks=int(w or 0), days=int(d or 0), hours=int(h or 0),
+                               minutes=int(mi or 0), seconds=int(s or 0))
+    return -delta if sign == "-" else delta
+
+
 # ── commands ──────────────────────────────────────────────────────────────────
 
 def cmd_sources(args, ctx):
@@ -774,7 +1052,8 @@ def cmd_sources(args, ctx):
     for c in cals:
         mark = "*" if default and c["id"] == default["id"] else " "
         state = " (disabled)" if c["disabled"] else ""
-        print("%s %-24s %-10s %4d events%s" % (mark, c["name"], c["type"], c["count"], state))
+        count = "   -" if c["count"] < 0 else "%4d" % c["count"]
+        print("%s %-24s %-10s %s events%s" % (mark, c["name"], c["type"], count, state))
     return 0
 
 
@@ -789,6 +1068,11 @@ def cmd_list(args, ctx):
     with tempfile.TemporaryDirectory() as tmp:
         for c in cals:
             if c["disabled"] and not args.include_disabled and c["id"] != default_id:
+                continue
+            if c.get("source") == "nextcloud":
+                for event in nextcloud_events(c, ctx["config"], days=args.days):
+                    event["default"] = c["id"] == default_id
+                    events.append(event)
                 continue
             if not c.get("store"):
                 continue
@@ -948,14 +1232,13 @@ def cmd_theme(args, ctx):
 
 def build_context(args):
     profile = find_profile(args.profile)
-    ctx = {"profile": profile, "config": None, "calendars": [], "default": None,
+    config = load_config(args.config)
+    ctx = {"profile": profile, "config": config, "calendars": [], "default": None,
            "force": getattr(args, "force", False), "tb_running": tb_running()}
-    if profile is not None:
-        ctx["config"] = load_config(args.config)
-        ctx["calendars"] = calendars_of(profile)
-        ctx["default"] = resolve_default(ctx["config"], ctx["calendars"])
-    else:
-        ctx["config"] = load_config(args.config)
+    calendars = calendars_of(profile) if profile is not None else []
+    calendars += nextcloud_calendars(config)
+    ctx["calendars"] = calendars
+    ctx["default"] = resolve_default(config, calendars)
     return ctx
 
 
@@ -1003,8 +1286,9 @@ def main(argv=None):
         parser.print_help()
         return 2
     ctx = build_context(args)
-    if args.func in (cmd_sources, cmd_list, cmd_default) and ctx["profile"] is None:
-        print("omarchy-calendar: no Thunderbird profile found", file=sys.stderr)
+    if args.func in (cmd_sources, cmd_list) and not ctx["calendars"]:
+        print("omarchy-calendar: no Thunderbird profile and no Nextcloud calendars",
+              file=sys.stderr)
         return 1
     return args.func(args, ctx)
 

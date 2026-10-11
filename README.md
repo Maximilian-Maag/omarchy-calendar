@@ -59,7 +59,37 @@ omarchy-calendar promote --apply    # default overwrites the other calendars
 omarchy-calendar theme --json       # the applied Omarchy palette as hex
 ```
 
-Config: `~/.config/omarchy-calendar/calendar.json` (overrides the shipped
+## Nextcloud (CalDAV)
+
+Add a `nextcloud` block and the account's CalDAV calendars are merged into the same
+view as the Thunderbird ones (`sources` lists them, `list` shows their events, and a
+Nextcloud calendar can be the default):
+
+```json
+{
+  "default_calendar": "Persönlich",
+  "nextcloud": {
+    "base_url": "https://cloud.example",
+    "user": "<login name>",
+    "principal": "<DAV principal / user id>",
+    "password_command": "secret-tool lookup server Nextcloud type base64 user '<keyring key>'",
+    "encoding": "base64"
+  }
+}
+```
+
+`password_command` is run and its stdout used as the DAV password (`encoding: base64`
+decodes it first) — the Nextcloud desktop client already keeps an app password in the
+freedesktop keyring, so nothing secret needs to live in the config. The DAV *user* is
+the login name while the `/remote.php/dav/calendars/<principal>/` path uses the user
+**id**, which can differ.
+
+Nextcloud calendars are read-only for now: `combine`/`promote` write only to the
+Thunderbird stores.
+
+## Config
+
+`~/.config/omarchy-calendar/calendar.json` (overrides the shipped
 `config/calendar.json`):
 
 ```json

@@ -8,10 +8,10 @@
     "Files this repository ships but cannot meaningfully mutate here are listed under",
     "'exempt' with a reason, which the policy check enforces."
   ],
-  "min_kill_rate": 0.80,
+  "min_kill_rate": 0.8,
   "timeout": 90,
-  "per_operator": 3,
-  "max_mutants": 160,
+  "per_operator": 6,
+  "max_mutants": 220,
   "targets": [
     {
       "path": "bin/omarchy-calendar",
@@ -21,7 +21,15 @@
         "-m",
         "unittest",
         "tests.test_unit_calendar",
+        "tests.test_unit_nextcloud",
         "tests.test_integration_cli"
+      ],
+      "equivalent": [
+        {
+          "line": 487,
+          "kind": "le->lt",
+          "reason": "`if master_start <= moment <= horizon` guards an RDATE. le->lt can only differ for an RDATE exactly equal to master_start, and that slot is either already produced by the RRULE expansion (so sorted(set(starts)) de-duplicates it) or is present in `excluded` (an EXDATE/exception), where the `not in excluded` clause rejects it under both forms. Proved by measurement: applying the mutant to a temp copy and diffing the target's full test output against the baseline is byte-identical after normalising unittest's elapsed-time line."
+        }
       ]
     },
     {

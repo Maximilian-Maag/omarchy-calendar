@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "Maximilian-Maag.calendar",
   "name": "Calendar",
-  "version": "0.1.3",
+  "version": "0.2.0",
   "author": "Maximilian-Maag",
   "license": "MIT",
   "description": "Thunderbird is the Omarchy calendar hub: one default calendar aggregates every calendar (e-mail CalDAV, Nextcloud, local), combine merges scattered events into it, and promote makes it authoritative over the rest.",
@@ -24,7 +24,8 @@
       "promote makes the default authoritative, overwriting the same UID elsewhere",
       "Reads the Thunderbird calendar store directly (microsecond times, expanded recurrence)",
       "Follows the applied Omarchy theme palette, no hardcoded colours",
-      "Hyprland keybinding to show upcoming events"
+      "Hyprland keybinding to show upcoming events",
+      "Nextcloud CalDAV calendars as a read source, merged into the same default-calendar view"
     ]
   }
 }

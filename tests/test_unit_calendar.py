@@ -315,6 +315,28 @@ class AggregationTests(unittest.TestCase):
         self.assertEqual(cal.event_key(self._event("other", "e", "t2")), "e")
 
 
+class OccurrencesOfTests(unittest.TestCase):
+    def test_absent_allday_and_floating_default_to_false(self):
+        # an event dict without the flags must be read as a zoned event (local time),
+        # not as all-day/UTC midnight.
+        us = int(datetime.datetime(2026, 6, 5, 9, tzinfo=datetime.timezone.utc).timestamp()) * USECS
+        event = {"id": "e", "calendar": "c", "start_usecs": us,
+                 "end_usecs": us + 3600 * USECS, "status": ""}
+        start, _ = cal.occurrences_of(event, datetime.datetime(2026, 6, 6))[0]
+        self.assertEqual(start, datetime.datetime.fromtimestamp(us // USECS))
+        self.assertNotEqual(start, cal.to_display(us, allday=True))
+
+    def test_rdate_at_master_start_does_not_duplicate(self):
+        us = int(datetime.datetime(2026, 6, 5, 9).timestamp()) * USECS
+        event = {"id": "e", "calendar": "c", "start_usecs": us, "end_usecs": us + 3600 * USECS,
+                 "status": "", "allday": False, "floating": False,
+                 "rule": {"FREQ": "DAILY", "COUNT": "2"},
+                 "rdate": [cal.to_display(us)], "exdate": set(), "exceptions": set()}
+        occ = cal.occurrences_of(event, datetime.datetime(2026, 6, 10))
+        starts = [s for s, _ in occ]
+        self.assertEqual(len(starts), len(set(starts)))          # no duplicate
+
+
 class FormatTests(unittest.TestCase):
     def test_format_timed_event(self):
         event = {"start": "2026-06-05T09:30", "title": "Standup", "default": False}
@@ -326,6 +348,16 @@ class FormatTests(unittest.TestCase):
         line = cal.format_event(event, {}, color=False)
         self.assertIn("2026-06-05", line)
         self.assertNotIn("00:00", line)
+
+    def test_format_event_colours_by_default(self):
+        event = {"start": "2026-06-05T09:30", "title": "X", "default": True}
+        self.assertIn("\033[", cal.format_event(event, {"accent": "#ff0000"}))
+
+    def test_save_config_writes_sorted_keys(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = pathlib.Path(d) / "a" / "calendar.json"
+            cal.save_config({"zeta": 1, "alpha": 2}, path)
+            self.assertTrue(path.read_text().startswith('{\n  "alpha": 2,'))
 
     def test_style_wraps_and_resets(self):
         out = cal.style("x", "#ff0000", True)
@@ -478,6 +510,15 @@ class ProfileFinderMoreTests(unittest.TestCase):
         self.assertEqual(cal._profile_from_ini(base / "profiles.ini", base).name,
                          "r.default-release")
 
+    def test_relative_profile_requires_BOTH_path_and_IsRelative(self):
+        # rule 4 returns the first profile with Path *and* IsRelative; a section with
+        # Path but no IsRelative must be skipped, not returned.
+        base = self._base("[Profile0]\nPath=a.profile\n"
+                          "[Profile1]\nPath=b.profile\nIsRelative=1\n")
+        (base / "a.profile").mkdir()
+        (base / "b.profile").mkdir()
+        self.assertEqual(cal._profile_from_ini(base / "profiles.ini", base).name, "b.profile")
+
     def test_default_flag_beats_first_relative(self):
         base = self._base("[Profile0]\nPath=a.profile\nIsRelative=1\n"
                           "[Profile1]\nPath=b.profile\nIsRelative=1\nDefault=1\n")
@@ -524,6 +565,23 @@ class OccurrenceBoundaryTests(unittest.TestCase):
         start = datetime.datetime(2026, 1, 15, 9, 0)
         occ = cal._monthly_occurrences(start, 1, [], datetime.datetime(2027, 1, 1), 3)
         self.assertEqual(len(occ), 3)
+
+    def test_monthly_stops_mid_month_at_limit(self):
+        # two days per month, so the limit is reached part-way through a month
+        start = datetime.datetime(2026, 1, 1, 9, 0)
+        occ = cal._monthly_occurrences(start, 1, [1, 15], datetime.datetime(2027, 1, 1), 3)
+        self.assertEqual([(o.month, o.day) for o in occ], [(1, 1), (1, 15), (2, 1)])
+
+    def test_yearly_stops_at_limit(self):
+        start = datetime.datetime(2026, 3, 1, 9, 0)
+        occ = cal._yearly_occurrences(start, 1, datetime.datetime(2100, 1, 1), 3)
+        self.assertEqual(len(occ), 3)
+
+    def test_datetime_until_includes_the_exact_boundary(self):
+        start = datetime.datetime(2026, 1, 1, 9, 0)
+        occ = cal.expand_occurrences(start, {"FREQ": "DAILY", "UNTIL": "20260103T090000"},
+                                     datetime.datetime(2026, 6, 1))
+        self.assertEqual([o.day for o in occ], [1, 2, 3])
 
     def test_monthly_horizon_before_first_returns_empty(self):
         start = datetime.datetime(2026, 6, 15, 9, 0)

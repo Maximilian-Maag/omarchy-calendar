@@ -2,6 +2,28 @@
 
 All notable changes to omarchy-calendar are documented here.
 
+## [0.2.0] — 2026-10-11
+
+### Added
+- **Nextcloud (CalDAV) calendars as a read source.** With a `nextcloud` block in the
+  config, `sources` lists the account's CalDAV calendars next to the Thunderbird ones
+  and `list` merges their events into the same view (the default calendar still wins on
+  a UID collision). Calendar data is fetched with a `REPORT` calendar-query and parsed
+  from iCalendar (DTSTART/DTEND/DURATION, all-day, TZID/UTC/floating, RRULE, EXDATE,
+  RDATE, and `RECURRENCE-ID` detached exceptions).
+- Credentials come from a `password_command` (stdout used, optional base64 decode) —
+  which is how the Nextcloud desktop client's app password is read from the keyring
+  (`secret-tool lookup server Nextcloud …`), so no secret is stored in the config.
+- `dav_request` is an injectable seam: every CalDAV test runs network-free.
+
+### Fixed
+- **CalDAV `calendar-data` extraction matched a hard-coded `c:` prefix.** Nextcloud /
+  Sabre answers with `<cal:calendar-data>`, so every calendar returned **zero** events
+  with a 207 status while the raw body carried hundreds (measured: 212 in *Persönlich*,
+  67 in *Arbeit*). The match is now prefix-agnostic.
+- Tests no longer read the user's real `~/.config/omarchy-calendar/calendar.json`
+  (a machine's Nextcloud config was leaking into the e2e and integration runs).
+
 ## [0.1.3] — 2026-10-11
 
 ### Fixed

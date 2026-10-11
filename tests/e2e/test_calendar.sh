@@ -40,7 +40,7 @@ store("local.sqlite", "uuid-home", [("h1", "Home event", far)])
 store("uuid-work.sqlite", "uuid-work", [("w1", "Work event", far+3600)])
 PY
 
-OUT="$("$CLI" --profile "$PROFILE" list --json --days 100000)"
+OUT="$("$CLI" --profile "$PROFILE" --config "$WORK/calendar.json" list --json --days 100000)"
 echo "$OUT"
 COUNT="$(python3 -c "import json,sys;print(json.load(sys.stdin)['count'])" <<<"$OUT")"
 if [[ $COUNT == 2 ]]; then
