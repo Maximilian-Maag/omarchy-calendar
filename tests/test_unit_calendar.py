@@ -12,6 +12,7 @@ import os
 import pathlib
 import sqlite3
 import tempfile
+import time
 import unittest
 import unittest.mock
 
@@ -67,11 +68,23 @@ class TimeTests(unittest.TestCase):
     def test_to_display_defaults_to_zoned_conversion(self):
         # the allday/floating defaults are False: with neither flag set a stored
         # instant is converted to local time, NOT read back as UTC wall clock.
-        us = int(datetime.datetime(2026, 6, 5, 12, tzinfo=datetime.timezone.utc).timestamp()) * USECS
-        self.assertEqual(cal.to_display(us),
-                         datetime.datetime.fromtimestamp(us // USECS))
-        self.assertNotEqual(cal.to_display(us),
-                            cal.to_display(us, allday=True))
+        # That only differs from the allday branch when local time is not UTC, so
+        # pin a non-UTC zone — otherwise this passes trivially on a UTC runner.
+        old_tz = os.environ.get("TZ")
+        os.environ["TZ"] = "Europe/Berlin"
+        time.tzset()
+        try:
+            us = int(datetime.datetime(2026, 6, 5, 12, tzinfo=datetime.timezone.utc).timestamp()) * USECS
+            self.assertEqual(cal.to_display(us),
+                             datetime.datetime.fromtimestamp(us // USECS))
+            self.assertNotEqual(cal.to_display(us),
+                                cal.to_display(us, allday=True))
+        finally:
+            if old_tz is None:
+                os.environ.pop("TZ", None)
+            else:
+                os.environ["TZ"] = old_tz
+            time.tzset()
 
 
 class RuleTests(unittest.TestCase):
