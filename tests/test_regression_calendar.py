@@ -7,6 +7,8 @@ import datetime
 import importlib.machinery
 import importlib.util
 import pathlib
+import sqlite3
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -114,6 +116,67 @@ class DedupeRegression(unittest.TestCase):
         merged = cal.merge_events(events, "home")
         self.assertEqual(len(merged), 1)
         self.assertEqual(merged[0]["title"], "d")
+
+
+
+class CombineApplyRegression(unittest.TestCase):
+    """BUG: `combine --apply` printed the plan and returned 0 but wrote nothing —
+    the store was byte-identical afterwards (a silent no-op behind a --apply flag).
+    """
+
+    def test_combine_apply_writes_into_the_default_store(self):
+        import sys
+        sys.path.insert(0, str(ROOT / "tests"))
+        from test_unit_calendar import make_full_store
+        with tempfile.TemporaryDirectory() as d:
+            profile = pathlib.Path(d) / "profile"
+            (profile / "calendar-data").mkdir(parents=True)
+            (profile / "prefs.js").write_text(
+                'user_pref("calendar.registry.uuid-home.name", "Home");\n'
+                'user_pref("calendar.registry.uuid-home.type", "storage");\n'
+                'user_pref("calendar.registry.uuid-work.name", "Work");\n'
+                'user_pref("calendar.registry.uuid-work.type", "caldav");\n')
+            make_full_store(profile / "calendar-data" / "local.sqlite", "uuid-home",
+                            [("h1", "Home event")])
+            make_full_store(profile / "calendar-data" / "uuid-work.sqlite", "uuid-work",
+                            [("w1", "Work event")])
+            cfg = pathlib.Path(d) / "calendar.json"
+            cfg.write_text('{"default_calendar": "uuid-home"}')
+            r = subprocess.run([sys.executable, str(CLI), "--profile", str(profile),
+                                "--config", str(cfg), "--force", "combine", "--apply"],
+                               capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn("combined 1 event", r.stdout)
+            conn = sqlite3.connect(str(profile / "calendar-data" / "local.sqlite"))
+            try:
+                titles = [row[0] for row in conn.execute(
+                    "SELECT title FROM cal_events ORDER BY title")]
+            finally:
+                conn.close()
+            self.assertEqual(titles, ["Home event", "Work event"])
+
+
+class DefaultConfigRegression(unittest.TestCase):
+    """BUG: `default <name>` saved the whole merged config, baking the shipped defaults
+    (aggregate, combine) into the user's file so a later shipped change was overridden.
+    """
+
+    def test_default_persists_only_the_override(self):
+        import sys, json
+        sys.path.insert(0, str(ROOT / "tests"))
+        from test_unit_calendar import make_full_store
+        with tempfile.TemporaryDirectory() as d:
+            profile = pathlib.Path(d) / "profile"
+            (profile / "calendar-data").mkdir(parents=True)
+            (profile / "prefs.js").write_text(
+                'user_pref("calendar.registry.uuid-home.name", "Home");\n'
+                'user_pref("calendar.registry.uuid-home.type", "storage");\n')
+            make_full_store(profile / "calendar-data" / "local.sqlite", "uuid-home", [])
+            cfg = pathlib.Path(d) / "calendar.json"
+            subprocess.run([sys.executable, str(CLI), "--profile", str(profile),
+                            "--config", str(cfg), "default", "Home"],
+                           capture_output=True, text=True)
+            self.assertEqual(json.loads(cfg.read_text()), {"default_calendar": "uuid-home"})
 
 
 if __name__ == "__main__":

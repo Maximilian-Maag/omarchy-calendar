@@ -60,7 +60,16 @@ omarchy-calendar theme --json       # the applied Omarchy palette as hex
 ```
 
 Config: `~/.config/omarchy-calendar/calendar.json` (overrides the shipped
-`config/calendar.json`). `{"default_calendar": "<name-or-id>"}`.
+`config/calendar.json`):
+
+```json
+{ "default_calendar": "<name-or-id>", "aggregate": true }
+```
+
+`default_calendar` is set for you by `omarchy-calendar default <name>`.
+`aggregate` (default `true`) is the default for the `list` view: when on, the same
+event copied into several calendars is shown once, with the default calendar's copy
+winning; `--no-aggregate` overrides it per run.
 
 ## How it reads Thunderbird
 

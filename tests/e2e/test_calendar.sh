@@ -43,7 +43,7 @@ PY
 OUT="$("$CLI" --profile "$PROFILE" list --json --days 100000)"
 echo "$OUT"
 COUNT="$(python3 -c "import json,sys;print(json.load(sys.stdin)['count'])" <<<"$OUT")"
-if [[ "$COUNT" == "2" ]]; then
+if [[ $COUNT == 2 ]]; then
   echo "e2e: ok — aggregated 2 events across 2 calendars"
   exit 0
 fi

@@ -120,6 +120,24 @@ class CliIntegration(unittest.TestCase):
         data = json.loads(r.stdout)
         self.assertEqual(data["writes"], [{"target": "uuid-work", "title": "Home event"}])
 
+    def test_aggregate_defaults_on_and_config_can_disable_it(self):
+        # same event id in both calendars: aggregation collapses them to one row
+        far = 4102444800
+        work_db = self.profile / "calendar-data" / "uuid-work.sqlite"
+        work_db.unlink()                    # replace the setUp store with our own
+        _store(work_db, "uuid-work",
+               [("home-1", "Shared", far), ("work-1", "Work event", far + 3600)])
+        data = json.loads(self.run_cli("list", "--json", "--days", "100000").stdout)
+        self.assertEqual(data["count"], 2)                       # home-1 dedupes to one
+        self.config.write_text('{"aggregate": false}')
+        data = json.loads(self.run_cli("list", "--json", "--days", "100000").stdout)
+        self.assertEqual(data["count"], 3)                       # both home-1 copies shown
+
+    def test_no_aggregate_flag_overrides_config(self):
+        self.config.write_text('{"aggregate": true}')
+        r = self.run_cli("list", "--json", "--no-aggregate", "--days", "100000")
+        self.assertEqual(json.loads(r.stdout)["count"], 2)
+
     def test_count_flag(self):
         self.assertEqual(self.run_cli("list", "--count", "--days", "100000").stdout.strip(), "2")
 
@@ -133,6 +151,16 @@ class CliIntegration(unittest.TestCase):
         colors.write_text('accent = "#abcdef"\n')
         r = self.run_cli("theme", "--json", "--colors", str(colors))
         self.assertEqual(json.loads(r.stdout)["accent"], "#abcdef")
+
+
+    def test_combine_apply_then_promote_apply(self):
+        # combine moves Work's event into Home, then promote pushes Home's events out.
+        r = self.run_cli("--force", "combine", "--apply")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("combined 1 event", r.stdout)
+        r = self.run_cli("--force", "promote", "--apply")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("promoted", r.stdout)
 
 
 if __name__ == "__main__":

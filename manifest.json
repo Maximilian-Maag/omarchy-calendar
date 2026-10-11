@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "Maximilian-Maag.calendar",
   "name": "Calendar",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "author": "Maximilian-Maag",
   "license": "MIT",
   "description": "Thunderbird is the Omarchy calendar hub: one default calendar aggregates every calendar (e-mail CalDAV, Nextcloud, local), combine merges scattered events into it, and promote makes it authoritative over the rest.",

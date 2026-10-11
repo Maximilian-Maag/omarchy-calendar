@@ -240,7 +240,8 @@ class ConfigTests(unittest.TestCase):
 
     def test_save_config_roundtrip(self):
         with tempfile.TemporaryDirectory() as d:
-            path = pathlib.Path(d) / "sub" / "calendar.json"
+            # two missing levels: parents=True is required to create them
+            path = pathlib.Path(d) / "a" / "b" / "calendar.json"
             cal.save_config({"default_calendar": "X"}, path)
             self.assertEqual(json.loads(path.read_text())["default_calendar"], "X")
             # saving again into the existing directory must not raise (exist_ok)
@@ -442,6 +443,14 @@ class ProfileFinderMoreTests(unittest.TestCase):
         with unittest.mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": str(base.parent)}):
             self.assertEqual(cal.find_profile().name, "r.default-release")
 
+    def test_find_profile_uses_ini_result_even_without_default_in_name(self):
+        # the ini's profile wins outright; it is not re-derived by scanning dirs, so
+        # a profile dir whose NAME lacks "default" must still be returned.
+        base = self._base("[Profile0]\nPath=profile-x\nIsRelative=1\n")
+        (base / "profile-x").mkdir()
+        with unittest.mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": str(base.parent)}):
+            self.assertEqual(cal.find_profile(), base / "profile-x")
+
     def test_find_profile_ignores_non_default_dirs_without_ini(self):
         d = tempfile.mkdtemp()
         base = pathlib.Path(d) / "thunderbird"
@@ -512,6 +521,99 @@ class OccurrenceBoundaryTests(unittest.TestCase):
         start = datetime.datetime(2026, 3, 1, 9, 0)
         occ = cal._yearly_occurrences(start, 1, datetime.datetime(2028, 3, 1, 9, 0), 100)
         self.assertEqual([o.year for o in occ], [2026, 2027, 2028])
+
+
+
+def make_full_store(path, cal_id, items):
+    """A store with cal_events + cal_properties (item, title) pairs."""
+    conn = sqlite3.connect(str(path))
+    conn.execute("CREATE TABLE cal_events (cal_id TEXT, id TEXT, time_created INTEGER, "
+                 "last_modified INTEGER, title TEXT, priority INTEGER, privacy TEXT, "
+                 "ical_status TEXT, flags INTEGER, event_start INTEGER, event_end INTEGER, "
+                 "event_stamp INTEGER, event_start_tz TEXT, event_end_tz TEXT, "
+                 "recurrence_id INTEGER, recurrence_id_tz TEXT, alarm_last_ack INTEGER, "
+                 "offline_journal INTEGER)")
+    conn.execute("CREATE TABLE cal_properties (item_id TEXT, key TEXT, value BLOB, "
+                 "recurrence_id INTEGER, recurrence_id_tz TEXT, cal_id TEXT)")
+    for eid, title in items:
+        conn.execute("INSERT INTO cal_events (cal_id,id,title,event_start,event_end,flags) "
+                     "VALUES (?,?,?,?,?,0)", (cal_id, eid, title, 1000 * USECS, 2000 * USECS))
+        conn.execute("INSERT INTO cal_properties (item_id,key,value,cal_id) VALUES (?,?,?,?)",
+                     (eid, "UID", ("uid-" + eid).encode(), cal_id))
+    conn.commit()
+    conn.close()
+
+
+class UserConfigTests(unittest.TestCase):
+    def test_load_user_config_only_user_keys(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = pathlib.Path(d) / "calendar.json"
+            p.write_text(json.dumps({"default_calendar": "Work"}))
+            self.assertEqual(cal.load_user_config(p), {"default_calendar": "Work"})
+
+    def test_load_user_config_absent_is_empty(self):
+        self.assertEqual(cal.load_user_config("/nonexistent/x.json"), {})
+
+
+class CopyItemsTests(unittest.TestCase):
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+        self.home = pathlib.Path(self.d) / "home.sqlite"
+        self.work = pathlib.Path(self.d) / "work.sqlite"
+        make_full_store(self.home, "uuid-home", [("h1", "Home event")])
+        make_full_store(self.work, "uuid-work", [("w1", "Work event")])
+
+    def _titles(self, path, cal_id):
+        conn = sqlite3.connect(str(path))
+        try:
+            return [r[0] for r in conn.execute(
+                "SELECT title FROM cal_events WHERE cal_id=? ORDER BY title", (cal_id,))]
+        finally:
+            conn.close()
+
+    def test_copies_item_into_another_store_with_new_cal_id(self):
+        n = cal.copy_items([(str(self.work), "uuid-work", "w1", str(self.home), "uuid-home")])
+        self.assertEqual(n, 1)
+        self.assertEqual(self._titles(self.home, "uuid-home"), ["Home event", "Work event"])
+        self.assertEqual(self._titles(self.home, "uuid-work"), [])   # cal_id was rewritten
+
+    def test_copies_iCal_properties_too(self):
+        cal.copy_items([(str(self.work), "uuid-work", "w1", str(self.home), "uuid-home")])
+        conn = sqlite3.connect(str(self.home))
+        try:
+            keys = [r[0] for r in conn.execute(
+                "SELECT key FROM cal_properties WHERE item_id='w1' AND cal_id='uuid-home'")]
+        finally:
+            conn.close()
+        self.assertEqual(keys, ["UID"])
+
+    def test_without_overwrite_duplicates(self):
+        move = (str(self.work), "uuid-work", "w1", str(self.home), "uuid-home")
+        cal.copy_items([move])
+        cal.copy_items([move])
+        self.assertEqual(self._titles(self.home, "uuid-home").count("Work event"), 2)
+
+    def test_overwrite_replaces(self):
+        move = (str(self.work), "uuid-work", "w1", str(self.home), "uuid-home")
+        cal.copy_items([move])
+        cal.copy_items([move], overwrite=True)
+        self.assertEqual(self._titles(self.home, "uuid-home").count("Work event"), 1)
+
+    def test_same_calendar_is_skipped(self):
+        n = cal.copy_items([(str(self.home), "uuid-home", "h1", str(self.home), "uuid-home")])
+        self.assertEqual(n, 0)
+        self.assertEqual(self._titles(self.home, "uuid-home"), ["Home event"])
+
+    def test_missing_destination_is_skipped(self):
+        n = cal.copy_items([(str(self.work), "uuid-work", "w1", "/nonexistent/x.sqlite", "c")])
+        self.assertEqual(n, 0)
+
+    def test_unknown_item_is_not_counted(self):
+        n = cal.copy_items([(str(self.work), "uuid-work", "nope", str(self.home), "uuid-home")])
+        self.assertEqual(n, 0)
+
+    def test_empty_moves(self):
+        self.assertEqual(cal.copy_items([]), 0)
 
 
 if __name__ == "__main__":
