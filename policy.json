@@ -1,0 +1,41 @@
+{
+  "checker": 3,
+  "plugin": true,
+  "shell_style": true,
+  "shebang": "bash",
+  "ignore": [],
+  "allow": {
+    "symlinks": {},
+    "artifacts": {},
+    "secrets": {},
+    "abs_path": {}
+  },
+  "tests": {
+    "kinds": [
+      "unit",
+      "regression",
+      "integration",
+      "e2e",
+      "shell"
+    ],
+    "integration_applicable": true,
+    "files": {
+      "unit": "tests/test_unit_*.py",
+      "regression": "tests/test_regression_*.py",
+      "integration": "tests/test_integration_*.py",
+      "e2e": "tests/e2e/test_*.sh",
+      "shell": "tests/shell/test_*.sh"
+    },
+    "runner": "tools/run_tests.sh",
+    "mutator": "tools/mutator.py",
+    "mutation_config": "tests/mutation.json",
+    "ci": ".github/workflows/test.yml",
+    "note": "unit, regression, integration, e2e (synthetic Thunderbird profile) and shell kinds plus mutation testing; see tools/run_tests.sh",
+    "min_kill_rate": 0.8,
+    "source_globs": [
+      "bin/*",
+      "hooks/*",
+      "tools/*.py"
+    ]
+  }
+}

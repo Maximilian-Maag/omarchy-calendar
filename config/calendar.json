@@ -1,0 +1,8 @@
+{
+  "default_calendar": "Home",
+  "aggregate": true,
+  "combine": {
+    "mode": "union",
+    "dedupe": "uid"
+  }
+}

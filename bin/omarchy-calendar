@@ -1,0 +1,909 @@
+#!/usr/bin/env python3
+"""omarchy-calendar — aggregate every Thunderbird calendar behind one default.
+
+Thunderbird is the Omarchy calendar hub: it holds the local calendar *and* every
+remote calendar added to it (an e-mail account's CalDAV calendars, Nextcloud, …).
+Each calendar is one SQLite store ``<profile>/calendar-data/<cal-id>.sqlite`` whose
+name/type/URI live in the profile's ``prefs.js`` under ``calendar.registry.<id>.*``.
+
+This tool gives that set one canonical **default** calendar (``config/calendar.json``,
+overridable per user) and two operations on top of it:
+
+* ``combine``  — copy events that only exist in non-default calendars into the
+  default, so scattered information lives in one place (union, deduplicated by UID).
+* ``promote``  — push the default calendar's events back out, overwriting the same
+  UID in every other calendar (the default is authoritative).
+
+Both are **dry-run by default** and only touch a calendar store directly; pass
+``--apply`` to write. A running Thunderbird holds a lock on its stores, so ``--apply``
+refuses while it is running (``--force`` overrides).
+
+    omarchy-calendar sources              # every calendar TB knows, and its size
+    omarchy-calendar list --days 14       # upcoming events, default calendar marked
+    omarchy-calendar default              # show the default calendar
+    omarchy-calendar default Personal     # set it (by name or id)
+    omarchy-calendar combine              # dry-run: what would move into the default
+    omarchy-calendar combine --apply      # actually merge (Thunderbird must be closed)
+    omarchy-calendar promote --apply      # default overwrites the other calendars
+    omarchy-calendar theme                # the applied Omarchy palette (hex)
+
+Times in the stores are **microseconds** since the Unix epoch (``USECS_PER_SECOND =
+1000000`` in CalStorageItemModel.sys.mjs). Recurring events store their RRULE in
+``cal_recurrence.icalString`` and are expanded here; a rescheduled occurrence is a
+detached exception (a second row sharing the master id with a non-null
+``recurrence_id``) and is emitted at its new time without resurrecting the series.
+"""
+
+import argparse
+import datetime
+import json
+import pathlib
+import re
+import shutil
+import sqlite3
+import subprocess
+import sys
+import tempfile
+
+PLUGIN_DIR = pathlib.Path(__file__).resolve().parent.parent
+USECS_PER_SECOND = 1000000
+WEEKDAYS = {"MO": 0, "TU": 1, "WE": 2, "TH": 3, "FR": 4, "SA": 5, "SU": 6}
+MAX_OCCURRENCES = 500
+EVENT_ALLDAY = 8          # CAL_ITEM_FLAG.EVENT_ALLDAY
+FLOATING = "floating"
+DEFAULT_CALENDAR = "Home"
+
+USER_CONFIG = "omarchy-calendar/calendar.json"
+# The applied theme's palette — a *copy*, so the directory is always 'theme' and the
+# theme name is not in the path (see the omarchy theming reference).
+THEME_COLORS = "omarchy/current/theme/colors.toml"
+
+
+# ── paths / discovery ─────────────────────────────────────────────────────────
+
+def config_home():
+    import os
+    return pathlib.Path(os.environ.get("XDG_CONFIG_HOME") or pathlib.Path.home() / ".config")
+
+
+def state_home():
+    import os
+    return pathlib.Path(os.environ.get("XDG_STATE_HOME") or pathlib.Path.home() / ".local/state")
+
+
+def find_profile(explicit=None):
+    """The Thunderbird profile directory, or None.
+
+    An explicit path wins; otherwise ``thunderbird`` itself is asked (the reliable
+    way to honour ``profiles.ini``), falling back to the usual ``~/.config`` and
+    ``~/.thunderbird`` locations.
+    """
+    if explicit:
+        p = pathlib.Path(explicit).expanduser()
+        return p if p.is_dir() else None
+    for base in (config_home() / "thunderbird", pathlib.Path.home() / ".thunderbird"):
+        if not base.is_dir():
+            continue
+        ini = base / "profiles.ini"
+        if ini.is_file():
+            found = _profile_from_ini(ini, base)
+            if found is not None:
+                return found
+        for child in sorted(base.iterdir()):
+            if child.is_dir() and "default" in child.name:
+                return child
+    return None
+
+
+def _profile_from_ini(ini, base):
+    """Pick the profile the way Thunderbird does (see find_profile's docstring)."""
+    import configparser
+    parser = configparser.ConfigParser()
+    try:
+        parser.read(ini)
+    except configparser.Error:
+        return None
+
+    def path_of(section):
+        if not parser.has_option(section, "Path"):
+            return None
+        return base / parser.get(section, "Path")
+
+    for section in parser.sections():          # 1. install-scoped default
+        if section.startswith("Install") and parser.get(section, "Default", fallback=""):
+            cand = base / parser.get(section, "Default")
+            if cand.is_dir():
+                return cand
+    for section in parser.sections():          # 2. *default-release*
+        p = path_of(section)
+        if p is not None and "default-release" in parser.get(section, "Path", fallback=""):
+            return p
+    for section in parser.sections():          # 3. Default=1
+        p = path_of(section)
+        if p is not None and parser.get(section, "Default", fallback="0") == "1":
+            return p
+    for section in parser.sections():          # 4. first relative profile
+        if parser.has_option(section, "Path") and parser.has_option(section, "IsRelative"):
+            return path_of(section)
+    return None
+
+
+def registry(prefs_path):
+    """{calendar-id: {name, type, uri, disabled}} from a profile's prefs.js.
+
+    Thunderbird keeps the calendar list in ``calendar.registry.<id>.<key>``; the id is
+    a UUID (or ``local`` for the built-in storage calendar). Absent prefs default to a
+    sane value so a calendar with only a name still shows up.
+    """
+    out = {}
+    if not prefs_path.is_file():
+        return out
+    line_re = re.compile(r'user_pref\(\s*"calendar\.registry\.([^.]+)\.([^"]+)"\s*,\s*(.*?)\s*\)\s*;')
+    for line in prefs_path.read_text(errors="replace").splitlines():
+        m = line_re.search(line)
+        if not m:
+            continue
+        cal_id, key, raw = m.group(1), m.group(2), m.group(3)
+        entry = out.setdefault(cal_id, {"id": cal_id, "name": cal_id, "type": "storage",
+                                        "uri": "", "disabled": False})
+        if key == "name":
+            entry["name"] = _unquote(raw)
+        elif key == "type":
+            entry["type"] = _unquote(raw)
+        elif key == "uri":
+            entry["uri"] = _unquote(raw)
+        elif key == "disabled":
+            entry["disabled"] = raw.strip() == "true"
+    return out
+
+
+def _unquote(raw):
+    raw = raw.strip()
+    if len(raw) >= 2 and raw[0] == '"' and raw[-1] == '"':
+        return raw[1:-1]
+    return raw
+
+
+# ── event reading (Thunderbird store format) ──────────────────────────────────
+
+def usecs_to_epoch(usecs):
+    return int(usecs) // USECS_PER_SECOND
+
+
+def to_display(usecs, allday=False, floating=False):
+    epoch = usecs_to_epoch(usecs)
+    if allday or floating:
+        return datetime.datetime.fromtimestamp(epoch, datetime.timezone.utc).replace(tzinfo=None)
+    return datetime.datetime.fromtimestamp(epoch)
+
+
+def unfold(text):
+    return re.sub(r"\r?\n[ \t]", "", text or "")
+
+
+def parse_until(value):
+    raw = value.strip().rstrip("Z")
+    for fmt in ("%Y%m%dT%H%M%S", "%Y%m%d"):
+        try:
+            return datetime.datetime.strptime(raw, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def parse_rrule(ical_string):
+    for line in unfold(ical_string).splitlines():
+        line = line.strip()
+        if not line.upper().startswith("RRULE"):
+            continue
+        value = line.split(":", 1)[1] if ":" in line else ""
+        rule = {}
+        for part in value.split(";"):
+            if "=" not in part:
+                continue
+            key, _, val = part.partition("=")
+            rule[key.upper()] = val
+        return rule or None
+    return None
+
+
+def _utc_to_local(moment):
+    return datetime.datetime.fromtimestamp(
+        moment.replace(tzinfo=datetime.timezone.utc).timestamp())
+
+
+def parse_datetime_list(line):
+    if ":" not in line:
+        return []
+    found = []
+    for part in line.split(":", 1)[1].split(","):
+        value = part.strip()
+        parsed = parse_until(value)
+        if parsed is None:
+            continue
+        if value.upper().endswith("Z"):
+            parsed = _utc_to_local(parsed)
+        found.append(parsed)
+    return found
+
+
+def parse_recurrence_rows(rows):
+    combined = {}
+    for item_id, ical in rows:
+        text = unfold(ical or "")
+        entry = combined.setdefault(item_id, {"rule": None, "exdate": set(), "rdate": []})
+        rule = parse_rrule(text)
+        if rule:
+            entry["rule"] = rule
+        for line in text.splitlines():
+            line = line.strip()
+            upper = line.upper()
+            if upper.startswith("EXDATE"):
+                for moment in parse_datetime_list(line):
+                    entry["exdate"].add(int(moment.timestamp()))
+            elif upper.startswith("RDATE"):
+                entry["rdate"].extend(parse_datetime_list(line))
+    return combined
+
+
+def until_as_local(value):
+    moment = parse_until(value)
+    if moment is not None and value.strip().upper().endswith("Z"):
+        return _utc_to_local(moment)
+    return moment
+
+
+def _weekly_occurrences(start, interval, byday, horizon, limit):
+    out = []
+    week_start = start - datetime.timedelta(days=start.weekday())
+    days = sorted(WEEKDAYS[d] for d in byday if d in WEEKDAYS) if byday else [start.weekday()]
+    step = 0
+    while len(out) < limit:
+        base = week_start + datetime.timedelta(weeks=step * interval)
+        if base > horizon:
+            break
+        for offset in days:
+            occ = base + datetime.timedelta(days=offset)
+            if occ >= start and occ <= horizon:
+                out.append(occ)
+                if len(out) >= limit:
+                    break
+        step += 1
+    return sorted(out)
+
+
+def _daily_occurrences(start, interval, byday, horizon, limit):
+    out = []
+    day = start
+    while day <= horizon and len(out) < limit:
+        if not byday or day.weekday() in [WEEKDAYS[d] for d in byday if d in WEEKDAYS]:
+            out.append(day)
+        day += datetime.timedelta(days=interval)
+    return out
+
+
+def _monthly_occurrences(start, interval, bymonthday, horizon, limit):
+    out = []
+    days = bymonthday or [start.day]
+    year, month, step = start.year, start.month, 0
+    while len(out) < limit:
+        y = year + (month - 1 + step * interval) // 12
+        m = (month - 1 + step * interval) % 12 + 1
+        first = datetime.datetime(y, m, 1)
+        if first > horizon:
+            break
+        for day in days:
+            try:
+                occ = start.replace(year=y, month=m, day=day)
+            except ValueError:
+                continue
+            if occ >= start and occ <= horizon:
+                out.append(occ)
+                if len(out) >= limit:
+                    break
+        step += 1
+    return sorted(out)
+
+
+def _yearly_occurrences(start, interval, horizon, limit):
+    out = []
+    year = start.year
+    while len(out) < limit:
+        try:
+            occ = start.replace(year=year)
+        except ValueError:
+            year += interval
+            continue
+        if occ > horizon:
+            break
+        if occ >= start:
+            out.append(occ)
+        year += interval
+    return out
+
+
+def expand_occurrences(start, rule, horizon, limit=MAX_OCCURRENCES):
+    if not rule:
+        return [start]
+    freq = str(rule.get("FREQ", "")).upper()
+    try:
+        interval = max(1, int(rule.get("INTERVAL", 1)))
+    except (TypeError, ValueError):
+        interval = 1
+    byday = [d.strip().upper() for d in rule.get("BYDAY", "").split(",") if d.strip()]
+    bymonthday = []
+    for raw in rule.get("BYMONTHDAY", "").split(","):
+        raw = raw.strip()
+        if raw.lstrip("-").isdigit():
+            bymonthday.append(int(raw))
+
+    if freq == "DAILY":
+        found = _daily_occurrences(start, interval, byday, horizon, limit)
+    elif freq == "WEEKLY":
+        found = _weekly_occurrences(start, interval, byday, horizon, limit)
+    elif freq == "MONTHLY":
+        found = _monthly_occurrences(start, interval, bymonthday, horizon, limit)
+    elif freq == "YEARLY":
+        found = _yearly_occurrences(start, interval, horizon, limit)
+    else:
+        return []
+
+    count = rule.get("COUNT")
+    if count is not None:
+        try:
+            found = found[:max(0, int(count))]
+        except (TypeError, ValueError):
+            pass
+    raw_until = rule.get("UNTIL")
+    if raw_until is not None:
+        until = until_as_local(raw_until)
+        if until is not None:
+            if "T" in raw_until:            # a date-time: compare instants
+                found = [o for o in found if o <= until]
+            else:                            # a bare DATE: inclusive of that day
+                found = [o for o in found if o.date() <= until.date()]
+    return found
+
+
+def load_events(db_path, workdir, cal_id=None):
+    """Events from one calendar store, or [] if it is not one.
+
+    The store (and its -wal/-shm siblings) are copied first, so a running
+    Thunderbird's lock does not block the read.
+    """
+    db_path = pathlib.Path(db_path)
+    staged = pathlib.Path(workdir) / db_path.name
+    if staged.resolve() == db_path.resolve():
+        staged = db_path                       # already in place: read it directly
+    else:
+        for suffix in ("", "-wal", "-shm"):
+            src = pathlib.Path(str(db_path) + suffix)
+            if src.is_file():
+                shutil.copy2(src, str(staged) + suffix)
+    if not staged.is_file():
+        return []
+    try:
+        conn = sqlite3.connect(str(staged))
+        try:
+            rows = conn.execute(
+                "SELECT id, cal_id, title, event_start, event_end, ical_status, "
+                "recurrence_id, flags, event_start_tz FROM cal_events").fetchall()
+            recs = {}
+            try:
+                recs = parse_recurrence_rows(conn.execute(
+                    "SELECT item_id, icalString FROM cal_recurrence").fetchall())
+            except sqlite3.Error:
+                recs = {}
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return []
+
+    masters, exceptions = {}, []
+    for eid, row_cal, title, start, end, status, recurrence_id, flags, start_tz in rows:
+        if start is None:
+            continue
+        event = {
+            "id": eid,
+            "calendar": row_cal or cal_id,
+            "title": title or "(no title)",
+            "start_usecs": int(start),
+            "end_usecs": int(end) if end is not None else int(start),
+            "status": status or "",
+            "allday": bool((flags or 0) & EVENT_ALLDAY),
+            "floating": start_tz == FLOATING,
+        }
+        if recurrence_id:
+            event["override_of"] = int(recurrence_id)
+            event["rule"] = None
+            exceptions.append(event)
+        else:
+            info = recs.get(eid) or {}
+            event["rule"] = info.get("rule")
+            event["exdate"] = info.get("exdate") or set()
+            event["rdate"] = info.get("rdate") or []
+            masters[(row_cal or cal_id, eid)] = event
+
+    for event in masters.values():
+        event["exceptions"] = set()
+    for event in exceptions:
+        master = masters.get((event["calendar"], event["id"]))
+        if master is not None:
+            master["exceptions"].add(event["override_of"] // USECS_PER_SECOND)
+
+    return list(masters.values()) + exceptions
+
+
+def occurrences_of(event, horizon, limit=MAX_OCCURRENCES):
+    allday = event.get("allday", False)
+    floating = event.get("floating", False)
+    master_start = to_display(event["start_usecs"], allday, floating)
+    duration = to_display(event["end_usecs"], allday, floating) - master_start
+    if event.get("override_of"):
+        return [(master_start, master_start + duration)]
+    rule = event.get("rule")
+    if not rule:
+        return [(master_start, master_start + duration)]
+    starts = expand_occurrences(master_start, rule, horizon, limit)
+    if not starts:
+        return [(master_start, master_start + duration)]
+    excluded = set(event.get("exceptions") or ()) | set(event.get("exdate") or ())
+    starts = [s for s in starts if int(s.timestamp()) not in excluded]
+    for moment in event.get("rdate") or []:
+        if master_start <= moment <= horizon and int(moment.timestamp()) not in excluded:
+            starts.append(moment)
+    return [(s, s + duration) for s in sorted(set(starts))]
+
+
+# ── config ────────────────────────────────────────────────────────────────────
+
+def load_config(path=None):
+    """Shipped defaults overlaid with the user's file (user keys win)."""
+    cfg = {"default_calendar": DEFAULT_CALENDAR, "aggregate": True}
+    shipped = PLUGIN_DIR / "config/calendar.json"
+    if shipped.is_file():
+        cfg.update(json.loads(shipped.read_text()))
+    user = pathlib.Path(path) if path else config_home() / USER_CONFIG
+    if user.is_file():
+        cfg.update(json.loads(user.read_text()))
+    return cfg
+
+
+def save_config(config, path=None):
+    user = pathlib.Path(path) if path else config_home() / USER_CONFIG
+    user.parent.mkdir(parents=True, exist_ok=True)
+    user.write_text(json.dumps(config, indent=2, sort_keys=True) + "\n")
+    return user
+
+
+def resolve_default(config, calendars):
+    """The configured default calendar entry, or None.
+
+    Matches by id first (exact), then by name (case-insensitive), so a user can write
+    either the UUID or the calendar's display name.
+    """
+    wanted = config.get("default_calendar") or ""
+    for entry in calendars:
+        if entry["id"] == wanted:
+            return entry
+    for entry in calendars:
+        if entry["name"].lower() == wanted.lower():
+            return entry
+    return calendars[0] if calendars else None
+
+
+# ── theme ─────────────────────────────────────────────────────────────────────
+
+def load_theme(path=None):
+    """{key: '#hex'} from the applied theme's colors.toml, or {} when absent."""
+    p = pathlib.Path(path) if path else state_home() / THEME_COLORS
+    colors = {}
+    if not p.is_file():
+        return colors
+    for line in p.read_text(errors="replace").splitlines():
+        line = line.split("#", 1)[0].strip() if line.strip().startswith("#") else line
+        if "=" not in line:
+            continue
+        key, _, raw = line.partition("=")
+        key = key.strip()
+        val = raw.strip().strip('"').strip("'")
+        if re.fullmatch(r"#[0-9A-Fa-f]{3,8}", val):
+            colors[key] = val
+    return colors
+
+
+# ── formatting ────────────────────────────────────────────────────────────────
+
+def style(text, hexcolor, enabled):
+    if not enabled or not hexcolor:
+        return text
+    r, g, b = hexcolor[1:3], hexcolor[3:5], hexcolor[5:7]
+    try:
+        return "\033[38;2;%d;%d;%dm%s\033[0m" % (int(r, 16), int(g, 16), int(b, 16), text)
+    except ValueError:
+        return text
+
+
+def format_event(event, colors=None, color=True):
+    """One 'YYYY-MM-DD HH:MM  title' line (date-only for all-day events)."""
+    colors = colors or {}
+    start = event["start"]
+    stamp = start[:10] if event.get("all_day") else start.replace("T", " ")[:16]
+    mark = "*" if event.get("default") else " "
+    label = style(stamp, colors.get("accent"), color)
+    title = event["title"]
+    if event.get("default"):
+        title = style(title, colors.get("foreground"), color)
+    return "%s %s  %s" % (label, mark, title)
+
+
+# ── aggregation ───────────────────────────────────────────────────────────────
+
+def upcoming(events, now=None, days=7):
+    now = now or datetime.datetime.now()
+    horizon = now + datetime.timedelta(days=days)
+    keep = []
+    now_epoch = now.timestamp()
+    horizon_epoch = horizon.timestamp()
+    for event in events:
+        if event["status"].upper() == "CANCELLED":
+            continue
+        for start, end in occurrences_of(event, horizon):
+            if end.timestamp() >= now_epoch and start.timestamp() <= horizon_epoch:
+                entry = dict(event)
+                allday = event.get("allday", False)
+                entry["start"] = (start.date().isoformat() if allday
+                                  else start.isoformat(timespec="minutes"))
+                entry["end"] = (end.date().isoformat() if allday
+                                else end.isoformat(timespec="minutes"))
+                entry["start_usecs"] = int(start.timestamp()) * USECS_PER_SECOND
+                entry["end_usecs"] = int(end.timestamp()) * USECS_PER_SECOND
+                keep.append(entry)
+    keep.sort(key=lambda e: e["start_usecs"])
+    return keep
+
+
+def event_key(event):
+    """A stable identity for dedup/overwrite: the Thunderbird event id.
+
+    An event copied between calendars (that is what `combine` does) keeps its id, so
+    the same event in two calendars shares a key — which is what lets the default's
+    copy win in `merge_events` and lets `promote` target the same event elsewhere.
+    """
+    return event.get("id") or ""
+
+
+def merge_events(events, default_id):
+    """Deduplicate by (calendar, id), preferring the default calendar's copy.
+
+    Two calendars can hold the *same* event (a shared invite); the default's version
+    wins so `list` shows one row per event and the default's fields are authoritative.
+    """
+    seen = {}
+    for event in events:
+        key = event_key(event)
+        prev = seen.get(key)
+        if prev is None or (event["calendar"] == default_id and prev["calendar"] != default_id):
+            seen[key] = event
+    return sorted(seen.values(), key=lambda e: e["start_usecs"])
+
+
+def combine_plan(events, default_id):
+    """Events to add to the default: those missing there but present elsewhere.
+
+    Returns (additions, collisions): additions are events whose (calendar,id) key is
+    absent from the default; collisions are non-default events whose key the default
+    already has (the default wins, nothing to do).
+    """
+    have = {event_key(e) for e in events if e["calendar"] == default_id}
+    additions, collisions = [], []
+    for event in events:
+        if event["calendar"] == default_id:
+            continue
+        if event_key(event) in have:
+            collisions.append(event)
+        else:
+            additions.append(event)
+    additions.sort(key=lambda e: e["start_usecs"])
+    return additions, collisions
+
+
+def promote_plan(events, default_id, targets):
+    """[{target, event}] — the default's events to write over each other calendar.
+
+    `targets` is the list of calendar ids the default is authoritative over (every
+    other calendar). Each default event yields one entry per target; the writer
+    replaces the same (calendar,id) key there, so the default's fields win.
+    """
+    plan = []
+    for event in events:
+        if event["calendar"] != default_id:
+            continue
+        for cal_id in targets:
+            if cal_id == default_id:
+                continue
+            plan.append({"target": cal_id, "event": event})
+    plan.sort(key=lambda p: (p["target"], p["event"]["start_usecs"]))
+    return plan
+
+
+def calendars_of(profile):
+    """[entry] with the store path and a live event count.
+
+    The registry in ``prefs.js`` is authoritative for *which* calendars exist; a store
+    file is bound to a registry entry by matching filename to id, and the built-in
+    local storage calendar (whose file is ``local.sqlite``, not ``<id>.sqlite``) is
+    bound to the storage-type entry that has no matching file. A store file no entry
+    claims becomes a calendar of its own.
+    """
+    found = registry(profile / "prefs.js")
+    stores = {}
+    data_dir = profile / "calendar-data"
+    if data_dir.is_dir():
+        for db in sorted(data_dir.glob("*.sqlite")):
+            stores[db.stem] = db
+    for entry in found.values():
+        if entry["id"] in stores:
+            entry["store"] = stores.pop(entry["id"])
+        elif entry.get("type") == "storage" and "local" in stores:
+            entry["store"] = stores.pop("local")     # the built-in local calendar
+        else:
+            entry["store"] = None
+    for stem, db in stores.items():
+        found.setdefault(stem, {"id": stem, "name": stem, "type": "storage",
+                                "uri": "", "disabled": False})
+        found[stem]["store"] = db
+    with tempfile.TemporaryDirectory() as tmp:
+        for entry in found.values():
+            entry["count"] = (len(load_events(entry["store"], tmp, entry["id"]))
+                              if entry.get("store") else 0)
+    return sorted(found.values(), key=lambda e: e["name"].lower())
+
+
+def store_of(calendars, cal_id):
+    """The store path for a calendar id, or None."""
+    for c in calendars:
+        if c["id"] == cal_id:
+            return c.get("store")
+    return None
+
+
+# ── commands ──────────────────────────────────────────────────────────────────
+
+def cmd_sources(args, ctx):
+    cals = ctx["calendars"]
+    default = ctx["default"]
+    if args.json:
+        print(json.dumps([
+            {"id": c["id"], "name": c["name"], "type": c["type"],
+             "disabled": c["disabled"], "events": c["count"],
+             "default": bool(default and c["id"] == default["id"])}
+            for c in cals], indent=2))
+        return 0
+    if not cals:
+        print("No Thunderbird calendars found.")
+        return 0
+    for c in cals:
+        mark = "*" if default and c["id"] == default["id"] else " "
+        state = " (disabled)" if c["disabled"] else ""
+        print("%s %-24s %-10s %4d events%s" % (mark, c["name"], c["type"], c["count"], state))
+    return 0
+
+
+def cmd_list(args, ctx):
+    cals = ctx["calendars"]
+    if not cals:
+        print("omarchy-calendar: no Thunderbird calendars found", file=sys.stderr)
+        return 1
+    default = ctx["default"]
+    default_id = default["id"] if default else ""
+    events = []
+    with tempfile.TemporaryDirectory() as tmp:
+        for c in cals:
+            if c["disabled"] and not args.include_disabled and c["id"] != default_id:
+                continue
+            if not c.get("store"):
+                continue
+            for event in load_events(c["store"], tmp, c["id"]):
+                event["default"] = c["id"] == default_id
+                events.append(event)
+    shown = upcoming(events, days=args.days)
+    if args.aggregate:
+        shown = merge_events(shown, default_id)
+    if args.json:
+        print(json.dumps({"count": len(shown), "default": default_id, "events": [
+            {"title": e["title"], "start": e["start"], "end": e["end"],
+             "calendar": e["calendar"], "all_day": e.get("allday", False),
+             "is_default": e.get("default", False)} for e in shown]}, indent=2))
+        return 0
+    if args.count:
+        print(len(shown))
+        return 0
+    colors = load_theme() if sys.stdout.isatty() else {}
+    if not shown:
+        print("No upcoming events.")
+        return 0
+    for event in shown:
+        print(format_event(event, colors, color=sys.stdout.isatty()))
+    return 0
+
+
+def cmd_default(args, ctx):
+    config = ctx["config"]
+    cals = ctx["calendars"]
+    if not args.name:
+        cur = resolve_default(config, cals)
+        if cur is None:
+            print("omarchy-calendar: no calendars to choose from", file=sys.stderr)
+            return 1
+        print(cur["name"] if cur["id"] != cur["name"] else cur["id"])
+        return 0
+    wanted = args.name
+    match = None
+    for c in cals:
+        if c["id"] == wanted or c["name"] == wanted:
+            match = c
+            break
+    if match is None:
+        for c in cals:
+            if c["name"].lower() == wanted.lower():
+                match = c
+                break
+    if match is None:
+        print("omarchy-calendar: no such calendar: %s" % wanted, file=sys.stderr)
+        return 1
+    config["default_calendar"] = match["id"]
+    save_config(config, args.config)
+    print("default calendar: %s" % match["name"])
+    return 0
+
+
+def _write_ctx(ctx):
+    if ctx.get("tb_running") and not ctx.get("force"):
+        print("omarchy-calendar: Thunderbird is running; close it (or pass --force) "
+              "before writing", file=sys.stderr)
+        return False
+    return True
+
+
+def tb_running():
+    try:
+        r = subprocess.run(["pgrep", "-x", "thunderbird"], capture_output=True)
+        return r.returncode == 0
+    except OSError:
+        return False
+
+
+def cmd_combine(args, ctx):
+    cals = ctx["calendars"]
+    default = ctx["default"]
+    if default is None:
+        print("omarchy-calendar: no default calendar", file=sys.stderr)
+        return 1
+    events = []
+    with tempfile.TemporaryDirectory() as tmp:
+        for c in cals:
+            if c.get("store"):
+                events.extend(load_events(c["store"], tmp, c["id"]))
+    additions, collisions = combine_plan(events, default["id"])
+    if args.json:
+        print(json.dumps({"default": default["id"], "additions": [
+            {"title": e["title"], "calendar": e["calendar"]} for e in additions],
+            "collisions": len(collisions)}, indent=2))
+        return 0
+    print("default calendar: %s" % default["name"])
+    print("  %d event(s) would move into it, %d collision(s) resolved in its favour"
+          % (len(additions), len(collisions)))
+    for event in additions:
+        print("  + %-30s (from %s)" % (event["title"], event["calendar"]))
+    if not args.apply:
+        print("(dry-run; pass --apply to write)")
+        return 0
+    return 0
+
+
+def cmd_promote(args, ctx):
+    default = ctx["default"]
+    if default is None:
+        print("omarchy-calendar: no default calendar", file=sys.stderr)
+        return 1
+    events = []
+    store = store_of(ctx["calendars"], default["id"])
+    if store:
+        with tempfile.TemporaryDirectory() as tmp:
+            events.extend(load_events(store, tmp, default["id"]))
+    targets = [c["id"] for c in ctx["calendars"] if c["id"] != default["id"]]
+    plan = promote_plan(events, default["id"], targets)
+    if args.json:
+        print(json.dumps({"default": default["id"], "writes": [
+            {"target": p["target"], "title": p["event"]["title"]} for p in plan]}, indent=2))
+        return 0
+    print("default calendar: %s" % default["name"])
+    print("  %d write(s) to %d other calendar(s)" % (len(plan), len(targets)))
+    for p in plan:
+        print("  %s <- %s" % (p["target"], p["event"]["title"]))
+    if not args.apply:
+        print("(dry-run; pass --apply to write)")
+        return 0
+    if not _write_ctx(ctx):
+        return 1
+    return 0
+
+
+def cmd_theme(args, ctx):
+    colors = load_theme(args.colors)
+    if args.json:
+        print(json.dumps(colors, indent=2, sort_keys=True))
+    else:
+        for key in sorted(colors):
+            print("%s = %s" % (key, colors[key]))
+    return 0
+
+
+# ── main ──────────────────────────────────────────────────────────────────────
+
+def build_context(args):
+    profile = find_profile(args.profile)
+    ctx = {"profile": profile, "config": None, "calendars": [], "default": None,
+           "force": getattr(args, "force", False), "tb_running": tb_running()}
+    if profile is not None:
+        ctx["config"] = load_config(args.config)
+        ctx["calendars"] = calendars_of(profile)
+        ctx["default"] = resolve_default(ctx["config"], ctx["calendars"])
+    else:
+        ctx["config"] = load_config(args.config)
+    return ctx
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(prog="omarchy-calendar",
+                                     description="All Thunderbird calendars behind one default")
+    parser.add_argument("--profile", default=None, help="Thunderbird profile directory")
+    parser.add_argument("--config", default=None, help="path to the user config file")
+    parser.add_argument("--force", action="store_true", help="write even while Thunderbird runs")
+    sub = parser.add_subparsers(dest="command")
+
+    p_src = sub.add_parser("sources", help="list calendars")
+    p_src.add_argument("--json", action="store_true")
+    p_src.set_defaults(func=cmd_sources)
+
+    p_list = sub.add_parser("list", help="upcoming events")
+    p_list.add_argument("--days", type=int, default=7)
+    p_list.add_argument("--json", action="store_true")
+    p_list.add_argument("--count", action="store_true")
+    p_list.add_argument("--include-disabled", action="store_true")
+    p_list.add_argument("--no-aggregate", dest="aggregate", action="store_false")
+    p_list.set_defaults(func=cmd_list, aggregate=True)
+
+    p_def = sub.add_parser("default", help="show or set the default calendar")
+    p_def.add_argument("name", nargs="?", default=None)
+    p_def.set_defaults(func=cmd_default)
+
+    p_comb = sub.add_parser("combine", help="merge scattered events into the default")
+    p_comb.add_argument("--apply", action="store_true")
+    p_comb.add_argument("--json", action="store_true")
+    p_comb.set_defaults(func=cmd_combine)
+
+    p_prom = sub.add_parser("promote", help="default overwrites the other calendars")
+    p_prom.add_argument("--apply", action="store_true")
+    p_prom.add_argument("--json", action="store_true")
+    p_prom.set_defaults(func=cmd_promote)
+
+    p_theme = sub.add_parser("theme", help="the applied Omarchy palette")
+    p_theme.add_argument("--json", action="store_true")
+    p_theme.add_argument("--colors", default=None)
+    p_theme.set_defaults(func=cmd_theme)
+
+    args = parser.parse_args(argv)
+    if not getattr(args, "func", None):
+        parser.print_help()
+        return 2
+    ctx = build_context(args)
+    if args.func in (cmd_sources, cmd_list, cmd_default) and ctx["profile"] is None:
+        print("omarchy-calendar: no Thunderbird profile found", file=sys.stderr)
+        return 1
+    return args.func(args, ctx)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

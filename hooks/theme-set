@@ -1,0 +1,15 @@
+#!/bin/bash
+# omarchy hook: theme-set — record the active theme for omarchy-calendar.
+#
+# The calendar view reads the applied palette live from
+# ~/.local/state/omarchy/current/theme/colors.toml on every run, so nothing has to
+# be re-rendered here. This hook only stamps a state file so a long-running or
+# cached view can notice a theme change and refresh.
+set -euo pipefail
+
+THEME=$(echo "${1:-}" | tr '[:upper:]' '[:lower:]' | tr ' ' '-')
+[[ -z "$THEME" ]] && exit 0
+
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy-calendar"
+mkdir -p "$STATE_DIR"
+echo "$THEME" > "$STATE_DIR/active-theme"

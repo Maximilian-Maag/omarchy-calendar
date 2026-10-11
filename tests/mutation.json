@@ -1,0 +1,50 @@
+{
+  "_about": [
+    "Mutation-test targets for this plugin. Each target names the file to mutate and",
+    "the test command that must notice a change (the modules that cover it).",
+    "Run with tools/mutator.py, or as part of tools/run_tests.sh.",
+    "min_kill_rate is the floor: below it the run fails, and a target that yields no",
+    "mutants at all fails too, so a mutation pass can never be green over nothing.",
+    "Files this repository ships but cannot meaningfully mutate here are listed under",
+    "'exempt' with a reason, which the policy check enforces."
+  ],
+  "min_kill_rate": 0.80,
+  "timeout": 90,
+  "per_operator": 3,
+  "max_mutants": 160,
+  "targets": [
+    {
+      "path": "bin/omarchy-calendar",
+      "lang": "python",
+      "tests": [
+        "python3",
+        "-m",
+        "unittest",
+        "tests.test_unit_calendar",
+        "tests.test_integration_cli"
+      ]
+    },
+    {
+      "path": "hooks/theme-set",
+      "lang": "shell",
+      "tests": [
+        "bash",
+        "tests/shell/test_theme_set.sh"
+      ]
+    }
+  ],
+  "exempt": [
+    {
+      "path": "bin/bindings.lua",
+      "reason": "Hyprland Lua module; it is loaded by the compositor, not executed by any test runner, and the mutation runner has no Lua operator set. Its shape is pinned by a static check in the shell test."
+    },
+    {
+      "path": "tools/mutator.py",
+      "reason": "vendored byte-identical engine tooling, not plugin source; mutating it makes its own self-tests non-terminating and its shipped self-test only covers ~half its mutants"
+    },
+    {
+      "path": "tools/policy_check.py",
+      "reason": "vendored byte-identical engine tooling, not plugin source; it is exercised end-to-end by 'policy as code' on every run, and its unit tests live in the shared tooling repo"
+    }
+  ]
+}
