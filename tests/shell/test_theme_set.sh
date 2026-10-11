@@ -3,7 +3,7 @@
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-HOOK="$ROOT/hooks/theme-set"
+HOOK="$ROOT/hooks/calendar-theme-set"
 pass=0; fail=0
 ok()   { echo "  ok: $*"; pass=$((pass+1)); }
 bad()  { echo "  FAIL: $*"; fail=$((fail+1)); }

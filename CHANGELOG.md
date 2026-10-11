@@ -2,6 +2,17 @@
 
 All notable changes to omarchy-calendar are documented here.
 
+## [0.1.3] — 2026-10-11
+
+### Fixed
+- **The theme-set hook overwrote other plugins' theme-set hook.** `omarchy-hook-install`
+  names a hook after the *basename* of the file it is given, and every plugin that
+  ships a `hooks/theme-set` installs to the same `~/.config/omarchy/hooks/theme-set.d/theme-set`
+  — so installing this plugin clobbered omarchy-thunderbird's theme hook (and vice
+  versa). The hook is now named `hooks/calendar-theme-set` and installs alongside the
+  others. If you installed 0.1.0–0.1.2, re-run `install.sh` (and re-install any hook
+  that was overwritten).
+
 ## [0.1.2] — 2026-10-11
 
 ### Fixed

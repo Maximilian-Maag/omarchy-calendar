@@ -25,7 +25,7 @@
       ]
     },
     {
-      "path": "hooks/theme-set",
+      "path": "hooks/calendar-theme-set",
       "lang": "shell",
       "tests": [
         "bash",
