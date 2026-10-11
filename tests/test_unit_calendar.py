@@ -4,6 +4,7 @@ The shipped CLI has no ``.py`` extension (it is installed as ``omarchy-calendar`
 so it is loaded with a SourceFileLoader rather than imported by name.
 """
 
+import contextlib
 import datetime
 import importlib.machinery
 import importlib.util
@@ -25,6 +26,27 @@ cal = importlib.util.module_from_spec(_spec)
 _loader.exec_module(cal)
 
 USECS = 1000000
+
+
+@contextlib.contextmanager
+def non_utc_zone():
+    """Run the block with a non-UTC local zone, restoring it afterwards.
+
+    The UTC-vs-local conversion tests only bite when local time is not UTC; on a
+    UTC CI runner their assertions hold no matter which branch runs, so a mutant
+    would survive. Pinning a real zone keeps the suite equally strict everywhere.
+    """
+    old_tz = os.environ.get("TZ")
+    os.environ["TZ"] = "Europe/Berlin"
+    time.tzset()
+    try:
+        yield
+    finally:
+        if old_tz is None:
+            os.environ.pop("TZ", None)
+        else:
+            os.environ["TZ"] = old_tz
+        time.tzset()
 
 
 def make_store(path, rows=(), recurrence=()):
@@ -70,21 +92,12 @@ class TimeTests(unittest.TestCase):
         # instant is converted to local time, NOT read back as UTC wall clock.
         # That only differs from the allday branch when local time is not UTC, so
         # pin a non-UTC zone — otherwise this passes trivially on a UTC runner.
-        old_tz = os.environ.get("TZ")
-        os.environ["TZ"] = "Europe/Berlin"
-        time.tzset()
-        try:
+        with non_utc_zone():
             us = int(datetime.datetime(2026, 6, 5, 12, tzinfo=datetime.timezone.utc).timestamp()) * USECS
             self.assertEqual(cal.to_display(us),
                              datetime.datetime.fromtimestamp(us // USECS))
             self.assertNotEqual(cal.to_display(us),
                                 cal.to_display(us, allday=True))
-        finally:
-            if old_tz is None:
-                os.environ.pop("TZ", None)
-            else:
-                os.environ["TZ"] = old_tz
-            time.tzset()
 
 
 class RuleTests(unittest.TestCase):
@@ -322,9 +335,10 @@ class OccurrencesOfTests(unittest.TestCase):
         us = int(datetime.datetime(2026, 6, 5, 9, tzinfo=datetime.timezone.utc).timestamp()) * USECS
         event = {"id": "e", "calendar": "c", "start_usecs": us,
                  "end_usecs": us + 3600 * USECS, "status": ""}
-        start, _ = cal.occurrences_of(event, datetime.datetime(2026, 6, 6))[0]
-        self.assertEqual(start, datetime.datetime.fromtimestamp(us // USECS))
-        self.assertNotEqual(start, cal.to_display(us, allday=True))
+        with non_utc_zone():
+            start, _ = cal.occurrences_of(event, datetime.datetime(2026, 6, 6))[0]
+            self.assertEqual(start, datetime.datetime.fromtimestamp(us // USECS))
+            self.assertNotEqual(start, cal.to_display(us, allday=True))
 
     def test_rdate_at_master_start_does_not_duplicate(self):
         us = int(datetime.datetime(2026, 6, 5, 9).timestamp()) * USECS
