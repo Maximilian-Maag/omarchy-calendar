@@ -35,6 +35,7 @@ detached exception (a second row sharing the master id with a non-null
 """
 
 import argparse
+import calendar
 import datetime
 import json
 import pathlib
@@ -287,6 +288,11 @@ def _daily_occurrences(start, interval, byday, horizon, limit):
     return out
 
 
+def _last_day_of_month(year, month):
+    """The number of days in a month (28–31), leap years included."""
+    return calendar.monthrange(year, month)[1]
+
+
 def _monthly_occurrences(start, interval, bymonthday, horizon, limit):
     out = []
     days = bymonthday or [start.day]
@@ -297,9 +303,12 @@ def _monthly_occurrences(start, interval, bymonthday, horizon, limit):
         first = datetime.datetime(y, m, 1)
         if first > horizon:
             break
+        last_day = _last_day_of_month(y, m)
         for day in days:
+            # A negative BYMONTHDAY counts back from the end of the month (-1 = last).
+            resolved = day if day >= 1 else last_day + day + 1
             try:
-                occ = start.replace(year=y, month=m, day=day)
+                occ = start.replace(year=y, month=m, day=resolved)
             except ValueError:
                 continue
             if occ >= start and occ <= horizon:

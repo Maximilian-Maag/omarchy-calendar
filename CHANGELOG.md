@@ -2,6 +2,17 @@
 
 All notable changes to omarchy-calendar are documented here.
 
+## [0.1.2] — 2026-10-11
+
+### Fixed
+- **Negative `BYMONTHDAY` was silently dropped.** An RRULE such as
+  `FREQ=MONTHLY;BYMONTHDAY=-1` (last day of the month) produced no occurrences, so the
+  event fell back to its master date: `date(..., day=-1)` raised and the day was
+  skipped. It now resolves against the month length, leap years included
+  (`-1` in Feb 2028 is the 29th). `_last_day_of_month` is now `calendar.monthrange`,
+  which also removes a branchy leap-year calculation that had two equivalent mutants.
+- Added unit coverage for `BYMONTHDAY=1` and `BYMONTHDAY=-1`.
+
 ## [0.1.1] — 2026-10-11
 
 ### Fixed

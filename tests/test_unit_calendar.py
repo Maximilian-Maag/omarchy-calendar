@@ -517,6 +517,31 @@ class OccurrenceBoundaryTests(unittest.TestCase):
         occ = cal._monthly_occurrences(start, 1, [], datetime.datetime(2026, 1, 1), 100)
         self.assertEqual(occ, [])
 
+    def test_last_day_of_month(self):
+        self.assertEqual(cal._last_day_of_month(2026, 2), 28)
+        self.assertEqual(cal._last_day_of_month(2024, 2), 29)   # leap year
+        self.assertEqual(cal._last_day_of_month(2026, 12), 31)
+        self.assertEqual(cal._last_day_of_month(2026, 4), 30)
+
+    def test_negative_bymonthday_counts_from_month_end(self):
+        start = datetime.datetime(2026, 1, 15, 9, 0)
+        occ = cal._monthly_occurrences(start, 1, [-1], datetime.datetime(2026, 4, 30, 9, 0), 100)
+        self.assertEqual([(o.month, o.day) for o in occ],
+                         [(1, 31), (2, 28), (3, 31), (4, 30)])
+        self.assertEqual({o.hour for o in occ}, {9})            # time-of-day preserved
+
+    def test_positive_bymonthday_first_of_month(self):
+        start = datetime.datetime(2026, 1, 1, 9, 0)
+        occ = cal._monthly_occurrences(start, 1, [1], datetime.datetime(2026, 4, 1, 9, 0), 100)
+        self.assertEqual([(o.month, o.day) for o in occ],
+                         [(1, 1), (2, 1), (3, 1), (4, 1)])
+
+    def test_negative_bymonthday_through_expand(self):
+        start = datetime.datetime(2028, 1, 10, 9, 0)
+        occ = cal.expand_occurrences(start, {"FREQ": "MONTHLY", "BYMONTHDAY": "-1", "COUNT": "2"},
+                                     datetime.datetime(2028, 6, 1))
+        self.assertEqual([(o.month, o.day) for o in occ], [(1, 31), (2, 29)])   # 2028 is a leap year
+
     def test_yearly_includes_occurrence_on_horizon(self):
         start = datetime.datetime(2026, 3, 1, 9, 0)
         occ = cal._yearly_occurrences(start, 1, datetime.datetime(2028, 3, 1, 9, 0), 100)
