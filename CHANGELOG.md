@@ -2,6 +2,21 @@
 
 All notable changes to omarchy-calendar are documented here.
 
+## [0.3.0] — 2026-10-11
+
+### Added
+- **Writing back to Nextcloud over CalDAV.** When the default (or a promote target) is a
+  Nextcloud calendar, `combine`/`promote` now `PUT` the event's iCalendar object into it
+  instead of only touching Thunderbird stores — so "the default overwrites the other
+  calendars" holds for the CalDAV calendars too. `PUT` is create-or-replace keyed by UID,
+  so an existing event is overwritten in place and a missing one is added. Dry-run stays
+  the default; `--apply` writes. `--days` selects the window (default 3650).
+- Each parsed CalDAV event keeps its **raw iCalendar block** (`ics`) so write-back is
+  byte-faithful rather than re-serialised.
+
+Verified end to end against a live Nextcloud: MKCALENDAR 201 → PUT 201 → GET 200
+(body carried the event) → DELETE 204, on a throwaway calendar that was then removed.
+
 ## [0.2.0] — 2026-10-11
 
 ### Added

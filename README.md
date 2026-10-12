@@ -84,8 +84,11 @@ freedesktop keyring, so nothing secret needs to live in the config. The DAV *use
 the login name while the `/remote.php/dav/calendars/<principal>/` path uses the user
 **id**, which can differ.
 
-Nextcloud calendars are read-only for now: `combine`/`promote` write only to the
-Thunderbird stores.
+`combine`/`promote` write back over CalDAV when the default (or a target) is a
+Nextcloud calendar: the event's iCalendar object is `PUT` into the calendar, which is
+create-or-replace keyed by UID. Dry-run is the default; pass `--apply` to write, and
+`--days` to widen the window. Writes to a Thunderbird store still require Thunderbird
+to be closed.
 
 ## Config
 

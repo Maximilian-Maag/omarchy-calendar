@@ -73,8 +73,9 @@ def fake_request(mapping):
     """request(method, url, user, pw, body, depth) -> mapping[(method, url)]."""
     calls = []
 
-    def _req(method, url, user, password, body=None, depth=None, timeout=20):
-        calls.append((method, url, user, password))
+    def _req(method, url, user, password, body=None, depth=None, timeout=20,
+             content_type=None):
+        calls.append((method, url, user, password, body))
         return mapping.get((method, url), (0, ""))
 
     return _req, calls
@@ -227,9 +228,53 @@ class EventsFromIcsTests(unittest.TestCase):
         blob = "BEGIN:VEVENT\r\nUID:u1\r\nSUMMARY:x\r\nEND:VEVENT"
         self.assertEqual(cal._events_from_ics(blob, "c"), [])
 
+    def test_raw_ics_is_kept_for_write_back(self):
+        blob = vevent()
+        evs = cal._events_from_ics(blob, "c")
+        self.assertEqual(evs[0]["ics"], blob)
+
     def test_status_preserved(self):
         evs = cal._events_from_ics(vevent(status="CANCELLED"), "c")
         self.assertEqual(evs[0]["status"], "CANCELLED")
+
+
+class DavPutTests(unittest.TestCase):
+    NC2 = dict(NC, base_url="https://nc.example")
+    CAL = {"id": "nc:personal", "uri": "/remote.php/dav/calendars/uuid-1/personal/"}
+    ICS = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:u1\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+
+    def test_put_builds_the_object_url_and_is_text_calendar(self):
+        req, calls = fake_request({("PUT", "https://nc.example/remote.php/dav/calendars/uuid-1/personal/u1.ics"):
+                                   (201, "")})
+        ok = cal.dav_put_event(self.NC2, self.CAL["uri"], "u1", self.ICS, request=req, password="s")
+        self.assertTrue(ok)
+        self.assertEqual(calls[0][0], "PUT")
+        self.assertEqual(calls[0][4], self.ICS)          # body is the raw iCalendar
+
+    def test_put_reports_failure(self):
+        req, _ = fake_request({})
+        self.assertFalse(cal.dav_put_event(self.NC2, self.CAL["uri"], "u1", self.ICS,
+                                           request=req, password="s"))
+
+    def test_put_needs_uid_and_ics(self):
+        req, _ = fake_request({})
+        self.assertFalse(cal.dav_put_event(self.NC2, self.CAL["uri"], "", self.ICS, request=req,
+                                           password="s"))
+        self.assertFalse(cal.dav_put_event(self.NC2, self.CAL["uri"], "u1", "", request=req,
+                                           password="s"))
+
+    def test_put_events_counts_only_successes(self):
+        req, calls = fake_request({
+            ("PUT", "https://nc.example/remote.php/dav/calendars/uuid-1/personal/u1.ics"): (201, ""),
+            ("PUT", "https://nc.example/remote.php/dav/calendars/uuid-1/personal/u2.ics"): (403, ""),
+        })
+        n = cal.put_events({"nextcloud": self.NC2}, self.CAL,
+                           [{"id": "u1", "ics": self.ICS}, {"id": "u2", "ics": self.ICS}],
+                           request=req)
+        self.assertEqual(n, 1)
+
+    def test_put_events_unconfigured_is_zero(self):
+        self.assertEqual(cal.put_events({}, self.CAL, [{"id": "u1", "ics": "x"}]), 0)
 
 
 class NextcloudEventsTests(unittest.TestCase):

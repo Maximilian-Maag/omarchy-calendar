@@ -47,6 +47,7 @@ import subprocess
 import sys
 import tempfile
 import urllib.error
+import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 
@@ -806,7 +807,8 @@ def nc_secret(nc):
     return secret
 
 
-def dav_request(method, url, user, password, body=None, depth=None, timeout=20):
+def dav_request(method, url, user, password, body=None, depth=None, timeout=20,
+                content_type=None):
     """One DAV request -> (status, text). A failure to connect is status 0.
 
     Tests replace this function, so no unit test touches the network.
@@ -817,7 +819,7 @@ def dav_request(method, url, user, password, body=None, depth=None, timeout=20):
         token = base64.b64encode(("%s:%s" % (user, password)).encode()).decode()
         req.add_header("Authorization", "Basic " + token)
     if data is not None:
-        req.add_header("Content-Type", "application/xml; charset=utf-8")
+        req.add_header("Content-Type", content_type or "application/xml; charset=utf-8")
     if depth is not None:
         req.add_header("Depth", str(depth))
     try:
@@ -966,6 +968,34 @@ def nextcloud_events(cal, config, request=dav_request, now=None, days=7, passwor
     return events
 
 
+def dav_put_event(nc, cal_uri, uid, ics, request=dav_request, password=None):
+    """PUT one iCalendar object into a CalDAV calendar. True on 200/201/204.
+
+    CalDAV is create-or-replace keyed by the object name, so this both adds a missing
+    event and overwrites an existing one under the same UID.
+    """
+    pw = nc_secret(nc) if password is None else password
+    if not pw or not uid or not ics:
+        return False
+    url = "%s%s/%s.ics" % (nc["base_url"].rstrip("/"), cal_uri.rstrip("/"),
+                           urllib.parse.quote(uid, safe=""))
+    status, _ = request("PUT", url, nc.get("user"), pw, body=ics,
+                        content_type="text/calendar; charset=utf-8", timeout=30)
+    return status in (200, 201, 204)
+
+
+def put_events(config, cal, events, request=dav_request):
+    """Write each event that carries raw iCalendar (ics) into `cal`. Returns the count."""
+    nc = config.get("nextcloud")
+    if not nc or not cal.get("uri"):
+        return 0
+    written = 0
+    for event in events:
+        if dav_put_event(nc, cal["uri"], event.get("id"), event.get("ics"), request=request):
+            written += 1
+    return written
+
+
 def _events_from_ics(data, cal_id):
     """VEVENT blocks -> event dicts (master rows plus detached exceptions)."""
     masters, exceptions = {}, []
@@ -996,6 +1026,7 @@ def _events_from_ics(data, cal_id):
             "exdate": set(),
             "rdate": [],
             "exceptions": set(),
+            "ics": data,          # raw block, so it can be PUT back unchanged
         }
         if props.get("RRULE"):
             event["rule"] = parse_rrule("RRULE:" + props["RRULE"][0][0])
@@ -1159,7 +1190,9 @@ def cmd_combine(args, ctx):
     events = []
     with tempfile.TemporaryDirectory() as tmp:
         for c in cals:
-            if c.get("store"):
+            if c.get("source") == "nextcloud":
+                events.extend(nextcloud_events(c, ctx["config"], days=args.days))
+            elif c.get("store"):
                 events.extend(load_events(c["store"], tmp, c["id"]))
     additions, collisions = combine_plan(events, default["id"])
     if args.json:
@@ -1175,12 +1208,15 @@ def cmd_combine(args, ctx):
     if not args.apply:
         print("(dry-run; pass --apply to write)")
         return 0
-    if not _write_ctx(ctx):
-        return 1
-    default_store = store_of(cals, default["id"])
-    moves = [(store_of(cals, e["calendar"]), e["calendar"], e["id"], default_store, default["id"])
-             for e in additions]
-    written = copy_items(moves)
+    if default.get("source") == "nextcloud":
+        written = put_events(ctx["config"], default, additions)
+    else:
+        if not _write_ctx(ctx):
+            return 1
+        default_store = store_of(cals, default["id"])
+        moves = [(store_of(cals, e["calendar"]), e["calendar"], e["id"], default_store,
+                  default["id"]) for e in additions]
+        written = copy_items(moves)
     print("combined %d event(s) into %s." % (written, default["name"]))
     return 0
 
@@ -1208,12 +1244,19 @@ def cmd_promote(args, ctx):
     if not args.apply:
         print("(dry-run; pass --apply to write)")
         return 0
-    if not _write_ctx(ctx):
-        return 1
-    default_store = store_of(ctx["calendars"], default["id"])
-    moves = [(default_store, default["id"], e["id"], store_of(ctx["calendars"], p["target"]), p["target"])
-             for p in plan for e in [p["event"]]]
-    written = copy_items(moves, overwrite=True)
+    if default.get("source") == "nextcloud":
+        default_events = nextcloud_events(default, ctx["config"], days=args.days)
+        written = 0
+        for target in ctx["calendars"]:
+            if target["id"] != default["id"] and target.get("source") == "nextcloud":
+                written += put_events(ctx["config"], target, default_events)
+    else:
+        if not _write_ctx(ctx):
+            return 1
+        default_store = store_of(ctx["calendars"], default["id"])
+        moves = [(default_store, default["id"], p["event"]["id"],
+                  store_of(ctx["calendars"], p["target"]), p["target"]) for p in plan]
+        written = copy_items(moves, overwrite=True)
     print("promoted %d event(s) out of %s." % (written, default["name"]))
     return 0
 
@@ -1269,11 +1312,13 @@ def main(argv=None):
     p_comb = sub.add_parser("combine", help="merge scattered events into the default")
     p_comb.add_argument("--apply", action="store_true")
     p_comb.add_argument("--json", action="store_true")
+    p_comb.add_argument("--days", type=int, default=3650)
     p_comb.set_defaults(func=cmd_combine)
 
     p_prom = sub.add_parser("promote", help="default overwrites the other calendars")
     p_prom.add_argument("--apply", action="store_true")
     p_prom.add_argument("--json", action="store_true")
+    p_prom.add_argument("--days", type=int, default=3650)
     p_prom.set_defaults(func=cmd_promote)
 
     p_theme = sub.add_parser("theme", help="the applied Omarchy palette")
