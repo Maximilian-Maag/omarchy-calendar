@@ -314,9 +314,48 @@ def _last_day_of_month(year, month):
     return calendar.monthrange(year, month)[1]
 
 
-def _monthly_occurrences(start, interval, bymonthday, horizon, limit):
+def _monthly_day_set(year, month, bymonthday, byday):
+    """The day-of-month numbers a monthly rule selects in one month.
+
+    ``BYMONTHDAY`` gives explicit days (a negative value counts back from the end,
+    -1 = last). ``BYDAY`` gives either a plain weekday (``TU`` = every Tuesday) or an
+    ordinal weekday (``2TU`` = the second Tuesday, ``-1FR`` = the last Friday). When
+    both are present the rule is their INTERSECTION (the RFC 5545 "Friday the 13th"
+    form ``FREQ=MONTHLY;BYDAY=FR;BYMONTHDAY=13``). Returns ``None`` when neither is
+    given, so the caller can fall back to the master's day-of-month.
+    """
+    last_day = _last_day_of_month(year, month)
+    selected = None
+    if bymonthday:
+        selected = set()
+        for day in bymonthday:
+            resolved = day if day >= 1 else last_day + day + 1
+            if 1 <= resolved <= last_day:
+                selected.add(resolved)
+    if byday:
+        chosen = set()
+        for token in byday:
+            match = re.fullmatch(r"([+-]?\d+)?([A-Z]{2})", token)
+            if not match or match.group(2) not in WEEKDAYS:
+                continue
+            target = WEEKDAYS[match.group(2)]
+            matches = [d for d in range(1, last_day + 1)
+                       if datetime.date(year, month, d).weekday() == target]
+            ordinal = match.group(1)
+            if ordinal is None:
+                chosen.update(matches)          # every such weekday this month
+            else:
+                n = int(ordinal)
+                if 1 <= n <= len(matches):
+                    chosen.add(matches[n - 1])  # nth from the start
+                elif -len(matches) <= n <= -1:
+                    chosen.add(matches[n])      # nth from the end
+        selected = chosen if selected is None else (selected & chosen)
+    return selected
+
+
+def _monthly_occurrences(start, interval, bymonthday, horizon, limit, byday=()):
     out = []
-    days = bymonthday or [start.day]
     year, month, step = start.year, start.month, 0
     while len(out) < limit:
         y = year + (month - 1 + step * interval) // 12
@@ -324,12 +363,12 @@ def _monthly_occurrences(start, interval, bymonthday, horizon, limit):
         first = datetime.datetime(y, m, 1)
         if first > horizon:
             break
-        last_day = _last_day_of_month(y, m)
-        for day in days:
-            # A negative BYMONTHDAY counts back from the end of the month (-1 = last).
-            resolved = day if day >= 1 else last_day + day + 1
+        days = _monthly_day_set(y, m, bymonthday, byday)
+        if days is None:
+            days = {start.day}                  # no BYxxx: the master's day
+        for day in sorted(days):
             try:
-                occ = start.replace(year=y, month=m, day=resolved)
+                occ = start.replace(year=y, month=m, day=day)
             except ValueError:
                 continue
             if occ >= start and occ <= horizon:
@@ -377,7 +416,7 @@ def expand_occurrences(start, rule, horizon, limit=MAX_OCCURRENCES):
     elif freq == "WEEKLY":
         found = _weekly_occurrences(start, interval, byday, horizon, limit)
     elif freq == "MONTHLY":
-        found = _monthly_occurrences(start, interval, bymonthday, horizon, limit)
+        found = _monthly_occurrences(start, interval, bymonthday, horizon, limit, byday)
     elif freq == "YEARLY":
         found = _yearly_occurrences(start, interval, horizon, limit)
     else:

@@ -2,6 +2,18 @@
 
 All notable changes to omarchy-calendar are documented here.
 
+## [0.3.1] — 2026-10-28
+
+### Fixed
+- **Monthly recurrence ignored BYDAY, so ordinal rules landed on the wrong day** (#1).
+  `FREQ=MONTHLY;BYDAY=2TU` ("second Tuesday") expanded on the series master's
+  day-of-month (the 6th, say) instead of the second Tuesday — silently wrong dates with
+  no error, while `README.md` documents BYDAY support. `_monthly_occurrences` now takes
+  the parsed `BYDAY` and selects the right days: a plain weekday (`TU` = every Tuesday),
+  an ordinal weekday (`2TU`, `-1FR` = last Friday), and — when both are present — the
+  intersection with `BYMONTHDAY` (the RFC 5545 "Friday the 13th" form). A five-Monday
+  rule now correctly produces nothing in a four-Monday month. Covered by five unit tests.
+
 ## [0.3.0] — 2026-10-11
 
 ### Added

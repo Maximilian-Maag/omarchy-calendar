@@ -151,6 +151,54 @@ class RuleTests(unittest.TestCase):
         # February has no 31st, so it is skipped, not shifted to March 3rd.
         self.assertEqual([o.month for o in occ[:3]], [1, 3, 5])
 
+    def test_monthly_byday_ordinal(self):
+        # FREQ=MONTHLY;BYDAY=2TU -> the SECOND Tuesday, not the master's day-of-month.
+        start = datetime.datetime(2026, 1, 6, 9, 0)   # a Tuesday
+        occ = cal.expand_occurrences(start, {"FREQ": "MONTHLY", "BYDAY": "2TU"},
+                                     datetime.datetime(2026, 6, 1))
+        self.assertEqual([(o.month, o.day, o.strftime("%a")) for o in occ],
+                         [(1, 13, "Tue"), (2, 10, "Tue"), (3, 10, "Tue"),
+                          (4, 14, "Tue"), (5, 12, "Tue")])
+
+    def test_monthly_byday_first_ordinal(self):
+        start = datetime.datetime(2026, 1, 6, 9, 0)   # the first Tuesday of Jan 2026
+        occ = cal.expand_occurrences(start, {"FREQ": "MONTHLY", "BYDAY": "1TU", "COUNT": "3"},
+                                     datetime.datetime(2026, 12, 1))
+        self.assertEqual([(o.month, o.day, o.strftime("%a")) for o in occ],
+                         [(1, 6, "Tue"), (2, 3, "Tue"), (3, 3, "Tue")])
+
+    def test_monthly_byday_negative_ordinal_is_last(self):
+        # BYDAY=-1FR -> the LAST Friday of the month.
+        start = datetime.datetime(2026, 1, 2, 9, 0)   # a Friday
+        occ = cal.expand_occurrences(start, {"FREQ": "MONTHLY", "BYDAY": "-1FR"},
+                                     datetime.datetime(2026, 4, 1))
+        self.assertEqual([(o.month, o.day, o.strftime("%a")) for o in occ],
+                         [(1, 30, "Fri"), (2, 27, "Fri"), (3, 27, "Fri")])
+
+    def test_monthly_byday_plain_weekday_is_every_one(self):
+        # BYDAY=TU without an ordinal -> EVERY Tuesday of the month.
+        start = datetime.datetime(2026, 1, 6, 9, 0)
+        occ = cal.expand_occurrences(start, {"FREQ": "MONTHLY", "BYDAY": "TU"},
+                                     datetime.datetime(2026, 3, 1))
+        self.assertEqual([o.day for o in occ if o.month == 1], [6, 13, 20, 27])
+        self.assertTrue(all(o.strftime("%a") == "Tue" for o in occ))
+
+    def test_monthly_byday_and_bymonthday_intersect(self):
+        # The RFC 5545 "Friday the 13th" form: the day must satisfy BOTH.
+        start = datetime.datetime(2026, 1, 13, 9, 0)
+        occ = cal.expand_occurrences(
+            start, {"FREQ": "MONTHLY", "BYDAY": "FR", "BYMONTHDAY": "13"},
+            datetime.datetime(2026, 7, 1))
+        self.assertEqual([(o.month, o.day, o.strftime("%a")) for o in occ],
+                         [(2, 13, "Fri"), (3, 13, "Fri")])
+
+    def test_monthly_byday_absent_ordinal_skips_the_month(self):
+        # 5MO only exists in months with five Mondays; a four-Monday month yields nothing.
+        start = datetime.datetime(2026, 2, 2, 9, 0)   # Feb 2026: 4 Mondays
+        occ = cal.expand_occurrences(start, {"FREQ": "MONTHLY", "BYDAY": "5MO"},
+                                     datetime.datetime(2026, 4, 1))
+        self.assertEqual([(o.month, o.day) for o in occ], [(3, 30)])
+
     def test_yearly_leap(self):
         start = datetime.datetime(2024, 2, 29, 9, 0)
         occ = cal.expand_occurrences(start, {"FREQ": "YEARLY", "COUNT": "2"},
