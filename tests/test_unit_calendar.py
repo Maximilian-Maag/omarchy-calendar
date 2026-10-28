@@ -443,6 +443,38 @@ class ThemeTests(unittest.TestCase):
         self.assertEqual(cal.load_theme("/nonexistent/colors.toml"), {})
 
 
+    def test_recorded_theme_name_reads_the_hook_stamp(self):
+        with tempfile.TemporaryDirectory() as d:
+            (pathlib.Path(d) / "omarchy-calendar").mkdir()
+            (pathlib.Path(d) / "omarchy-calendar" / "active-theme").write_text("tokyo-night\n")
+            with unittest.mock.patch.dict(os.environ, {"XDG_STATE_HOME": d}):
+                self.assertEqual(cal.recorded_theme_name(), "tokyo-night")
+
+    def test_recorded_theme_name_empty_when_absent(self):
+        with tempfile.TemporaryDirectory() as d:
+            with unittest.mock.patch.dict(os.environ, {"XDG_STATE_HOME": d}):
+                self.assertEqual(cal.recorded_theme_name(), "")
+
+    def test_resolve_theme_name_matches_an_installed_theme(self):
+        with tempfile.TemporaryDirectory() as d:
+            theme = pathlib.Path(d) / "hackerman"
+            theme.mkdir()
+            (theme / "colors.toml").write_text('accent = "#82FB9C"\n')
+            colors = cal.load_theme(str(theme / "colors.toml"))
+            with unittest.mock.patch.object(cal, "theme_search_dirs", lambda: [theme]):
+                self.assertEqual(cal.resolve_theme_name(colors), "hackerman")
+
+    def test_applied_theme_name_prefers_the_recorded_value(self):
+        with unittest.mock.patch.object(cal, "recorded_theme_name", lambda: "tokyo-night"), \
+             unittest.mock.patch.object(cal, "resolve_theme_name", lambda c: "hackerman"):
+            self.assertEqual(cal.applied_theme_name({}), "tokyo-night")
+
+    def test_applied_theme_name_falls_back_to_a_colour_match(self):
+        with unittest.mock.patch.object(cal, "recorded_theme_name", lambda: ""), \
+             unittest.mock.patch.object(cal, "resolve_theme_name", lambda c: "hackerman"):
+            self.assertEqual(cal.applied_theme_name({}), "hackerman")
+
+
 class StoreTests(unittest.TestCase):
     def test_load_events_roundtrip(self):
         with tempfile.TemporaryDirectory() as d:

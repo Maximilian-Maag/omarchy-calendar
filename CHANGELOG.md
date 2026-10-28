@@ -2,6 +2,18 @@
 
 All notable changes to omarchy-calendar are documented here.
 
+## [0.3.2] — 2026-10-28
+
+### Fixed
+- **The theme-set hook stamped `active-theme` into a file nothing read** (#2). The hook
+  exists only to write `<state>/omarchy-calendar/active-theme` (its own comment says "so a
+  long-running or cached view can notice a theme change and refresh"), but no code — and no
+  long-running view — ever consumed it. The `theme` command now names the applied theme,
+  preferring the hook's recorded value and falling back to matching the applied colours
+  against the installed theme dirs (as omarchy-docker/-mpv/-tmux do), so the stamp is
+  finally read. New unit + integration tests for the recorded-wins, colour-match and
+  JSON-`name` paths.
+
 ## [0.3.1] — 2026-10-28
 
 ### Fixed

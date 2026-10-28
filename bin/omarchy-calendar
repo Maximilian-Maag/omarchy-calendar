@@ -1300,11 +1300,55 @@ def cmd_promote(args, ctx):
     return 0
 
 
+def recorded_theme_name():
+    """The theme name the theme-set hook last recorded, or ``""``.
+
+    ``hooks/calendar-theme-set`` stamps ``<state>/omarchy-calendar/active-theme`` on every
+    ``omarchy theme set``; the ``theme`` command reads it back so the applied theme can be
+    named (the applied ``colors.toml`` is a *copy* under a fixed ``theme`` directory, so the
+    name is not in the path).
+    """
+    import os
+    stamp = state_home() / "omarchy-calendar" / "active-theme"
+    try:
+        return stamp.read_text().strip()
+    except OSError:
+        return ""
+
+
+def theme_search_dirs():
+    """Every installed theme directory, system-wide first then per-user."""
+    dirs = []
+    for root in ("/usr/share/omarchy/themes", str(config_home() / "omarchy" / "themes")):
+        base = pathlib.Path(root)
+        if base.is_dir():
+            dirs.extend(sorted(p for p in base.iterdir() if p.is_dir()))
+    return dirs
+
+
+def resolve_theme_name(colors):
+    """Recover the applied theme's name by matching its colours against the themes."""
+    for directory in theme_search_dirs():
+        candidate = directory / "colors.toml"
+        if candidate.is_file() and load_theme(str(candidate)) == colors:
+            return directory.name
+    return ""
+
+
+def applied_theme_name(colors):
+    """The applied theme's name: the hook's record first, then a colour match, else ``""``."""
+    return recorded_theme_name() or resolve_theme_name(colors)
+
+
 def cmd_theme(args, ctx):
     colors = load_theme(args.colors)
+    name = applied_theme_name(colors)
     if args.json:
-        print(json.dumps(colors, indent=2, sort_keys=True))
+        payload = dict(colors)
+        payload["name"] = name
+        print(json.dumps(payload, indent=2, sort_keys=True))
     else:
+        print("applied-theme = %s" % (name or "(unknown)"))
         for key in sorted(colors):
             print("%s = %s" % (key, colors[key]))
     return 0

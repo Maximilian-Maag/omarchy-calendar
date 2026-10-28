@@ -162,6 +162,20 @@ class CliIntegration(unittest.TestCase):
         self.assertEqual(json.loads(r.stdout)["accent"], "#abcdef")
 
 
+    def test_theme_names_the_recorded_theme(self):
+        colors = pathlib.Path(self.tmp.name) / "colors.toml"
+        colors.write_text('accent = "#abcdef"\n')
+        state = pathlib.Path(self.tmp.name) / "state"
+        (state / "omarchy-calendar").mkdir(parents=True)
+        (state / "omarchy-calendar" / "active-theme").write_text("tokyo-night\n")
+        env = {**os.environ, "XDG_STATE_HOME": str(state)}
+        r = subprocess.run(
+            [sys.executable, str(CLI), "--profile", str(self.profile),
+             "--config", str(self.config), "theme", "--json", "--colors", str(colors)],
+            capture_output=True, text=True, env=env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(json.loads(r.stdout)["name"], "tokyo-night")
+
     def test_combine_apply_then_promote_apply(self):
         # combine moves Work's event into Home, then promote pushes Home's events out.
         r = self.run_cli("--force", "combine", "--apply")
