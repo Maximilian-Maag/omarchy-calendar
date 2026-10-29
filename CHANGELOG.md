@@ -2,6 +2,15 @@
 
 All notable changes to omarchy-calendar are documented here.
 
+## [0.3.3] — 2026-10-28
+
+### Fixed
+- **The applied theme name came from a stale hook stamp** (#3). `applied_theme_name()`
+  preferred the theme-set hook's stamp over Omarchy's authoritative
+  `<state>/omarchy/current/theme.name` (rewritten on every theme change, no hook needed)
+  and over the live colour match. Resolution is now: `current/theme.name` → colour match →
+  hook stamp. New tests, incl. that a stale stamp no longer wins.
+
 ## [0.3.2] — 2026-10-28
 
 ### Fixed

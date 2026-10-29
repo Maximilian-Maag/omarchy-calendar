@@ -1300,6 +1300,21 @@ def cmd_promote(args, ctx):
     return 0
 
 
+def omarchy_theme_name():
+    """Omarchy's own record of the applied theme, or ``""``.
+
+    ``omarchy-theme-set`` writes the slug to ``<state>/omarchy/current/theme.name`` on every
+    theme change, independently of this plugin's hook, so it is authoritative and always
+    current. The colour match and the hook stamp are only fallbacks.
+    """
+    import os
+    path = state_home() / "omarchy" / "current" / "theme.name"
+    try:
+        return path.read_text().strip().lower().replace(" ", "-")
+    except OSError:
+        return ""
+
+
 def recorded_theme_name():
     """The theme name the theme-set hook last recorded, or ``""``.
 
@@ -1336,8 +1351,12 @@ def resolve_theme_name(colors):
 
 
 def applied_theme_name(colors):
-    """The applied theme's name: the hook's record first, then a colour match, else ``""``."""
-    return recorded_theme_name() or resolve_theme_name(colors)
+    """The applied theme's name, most-authoritative source first.
+
+    Omarchy's ``current/theme.name``, then a colour match against the installed themes, and
+    only then the theme-set hook's stamp — a stale stamp must never win over a live source.
+    """
+    return omarchy_theme_name() or resolve_theme_name(colors) or recorded_theme_name()
 
 
 def cmd_theme(args, ctx):

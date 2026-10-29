@@ -464,15 +464,34 @@ class ThemeTests(unittest.TestCase):
             with unittest.mock.patch.object(cal, "theme_search_dirs", lambda: [theme]):
                 self.assertEqual(cal.resolve_theme_name(colors), "hackerman")
 
-    def test_applied_theme_name_prefers_the_recorded_value(self):
-        with unittest.mock.patch.object(cal, "recorded_theme_name", lambda: "tokyo-night"), \
-             unittest.mock.patch.object(cal, "resolve_theme_name", lambda c: "hackerman"):
-            self.assertEqual(cal.applied_theme_name({}), "tokyo-night")
+    def test_omarchy_theme_name_reads_current_theme_name(self):
+        with tempfile.TemporaryDirectory() as d:
+            cur = pathlib.Path(d) / "omarchy" / "current"
+            cur.mkdir(parents=True)
+            (cur / "theme.name").write_text("Yellow On Black\n")
+            with unittest.mock.patch.dict(os.environ, {"XDG_STATE_HOME": d}):
+                self.assertEqual(cal.omarchy_theme_name(), "yellow-on-black")
 
-    def test_applied_theme_name_falls_back_to_a_colour_match(self):
-        with unittest.mock.patch.object(cal, "recorded_theme_name", lambda: ""), \
-             unittest.mock.patch.object(cal, "resolve_theme_name", lambda c: "hackerman"):
-            self.assertEqual(cal.applied_theme_name({}), "hackerman")
+    def test_omarchy_theme_name_empty_when_absent(self):
+        with tempfile.TemporaryDirectory() as d:
+            with unittest.mock.patch.dict(os.environ, {"XDG_STATE_HOME": d}):
+                self.assertEqual(cal.omarchy_theme_name(), "")
+
+    def _applied(self, *, omarchy="", match="", stamp=""):
+        with unittest.mock.patch.object(cal, "omarchy_theme_name", lambda: omarchy), \
+             unittest.mock.patch.object(cal, "resolve_theme_name", lambda c: match), \
+             unittest.mock.patch.object(cal, "recorded_theme_name", lambda: stamp):
+            return cal.applied_theme_name({})
+
+    def test_omarchy_theme_name_beats_both_fallbacks(self):
+        self.assertEqual(self._applied(omarchy="hackerman", match="gruvbox",
+                                       stamp="tokyo-night"), "hackerman")
+
+    def test_a_stale_stamp_never_wins_over_a_colour_match(self):
+        self.assertEqual(self._applied(match="hackerman", stamp="tokyo-night"), "hackerman")
+
+    def test_the_stamp_is_only_the_last_resort(self):
+        self.assertEqual(self._applied(stamp="tokyo-night"), "tokyo-night")
 
 
 class StoreTests(unittest.TestCase):
