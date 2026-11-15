@@ -26,7 +26,7 @@ else
 fi
 
 # ── 3. Theme-set hook ─────────────────────────────────────────────────────────
-chmod +x "$PLUGIN_DIR/hooks/theme-set"
+chmod +x "$PLUGIN_DIR/hooks/calendar-theme-set"
 if command -v omarchy >/dev/null 2>&1; then
   omarchy hook install theme-set "$PLUGIN_DIR/hooks/calendar-theme-set"
   echo "  Installed theme-set hook."
