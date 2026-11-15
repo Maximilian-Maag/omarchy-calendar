@@ -265,5 +265,45 @@ class DisabledCalendarGateRegression(unittest.TestCase):
             self.assertIn("uuid-arch", cals)
 
 
+class PutEventsTbStoreRegression(unittest.TestCase):
+    """BUG: `put_events` only wrote events carrying a raw ``ics`` body, so a
+    Thunderbird-store-sourced addition was silently dropped from ``combine --apply``
+    into a Nextcloud default — the plan printed and the command exited 0.
+    """
+
+    def test_tb_store_event_is_written_with_a_synthesised_body(self):
+        nc = {"base_url": "https://nc.example", "user": "u", "principal": "p",
+              "password": "secret"}
+        calcon = {"id": "nc:work", "uri": "/remote.php/dav/calendars/u/work/"}
+        tb_event = {"id": "work-1", "calendar": "uuid-work", "title": "Work event",
+                    "start_usecs": 1000 * USECS, "end_usecs": 2000 * USECS,
+                    "allday": False, "floating": False}   # TB shape: no 'ics'
+        calls = []
+
+        def fake(nc_, uri, uid, ics, **kw):
+            calls.append((uid, ics))
+            return bool(ics)
+
+        orig = cal.dav_put_event
+        cal.dav_put_event = fake
+        try:
+            written = cal.put_events({"nextcloud": nc}, calcon, [tb_event])
+        finally:
+            cal.dav_put_event = orig
+        self.assertEqual(written, 1)
+        self.assertEqual(calls[0][0], "work-1")
+        self.assertTrue(calls[0][1])                       # a body was built, not None
+        self.assertIn("BEGIN:VEVENT", calls[0][1])
+        self.assertIn("SUMMARY:Work event", calls[0][1])
+
+    def test_event_ics_round_trips_through_the_parser(self):
+        event = {"id": "u9", "calendar": "c", "title": "Round trip",
+                 "start_usecs": 4000000 * USECS, "end_usecs": 5000000 * USECS,
+                 "allday": False, "floating": False}
+        parsed = cal._events_from_ics(cal.event_ics(event), "c")
+        self.assertEqual(parsed[0]["id"], "u9")
+        self.assertEqual(parsed[0]["title"], "Round trip")
+
+
 if __name__ == "__main__":
     unittest.main()

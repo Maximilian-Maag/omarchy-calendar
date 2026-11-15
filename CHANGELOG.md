@@ -2,6 +2,16 @@
 
 All notable changes to omarchy-calendar are documented here.
 
+## [0.3.5] — 2026-11-15
+
+### Fixed
+- **`combine --apply` silently dropped every Thunderbird-store addition** (#5).
+  `put_events` only wrote events carrying a raw `ics` body, so events loaded from a
+  Thunderbird store (which never set `ics`) were dropped while the plan printed and the
+  command exited 0. `put_events` now synthesises a minimal VEVENT when an event lacks
+  `ics`, so the write actually happens. Regression test drives `put_events` with a
+  TB-shaped event and a fake `dav_put_event`.
+
 ## [0.3.4] — 2026-11-15
 
 ### Fixed

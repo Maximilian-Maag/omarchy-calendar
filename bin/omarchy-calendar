@@ -1007,6 +1007,46 @@ def nextcloud_events(cal, config, request=dav_request, now=None, days=7, passwor
     return events
 
 
+def _ics_escape(text):
+    """Escape an iCalendar TEXT value (backslash, semicolon, comma, newline)."""
+    return ((text or "").replace("\\", "\\\\").replace(";", "\\;")
+            .replace(",", "\\,").replace("\r\n", "\\n").replace("\n", "\\n"))
+
+
+def event_ics(event):
+    """A minimal iCalendar object for an event that carries no raw ``ics`` body.
+
+    ``load_events`` yields Thunderbird-store events as structured fields, not the
+    original VEVENT text (only ``_events_from_ics`` attaches ``ics``). Building one
+    here is what lets those events be PUT to a CalDAV calendar at all — otherwise
+    ``dav_put_event`` refuses the empty body and the write is silently dropped.
+    """
+    allday = event.get("allday", False)
+    floating = event.get("floating", False)
+    start = to_display(event["start_usecs"], allday, floating)
+    end = to_display(event["end_usecs"], allday, floating)
+    lines = ["BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//omarchy-calendar//EN",
+             "BEGIN:VEVENT", "UID:%s" % event["id"],
+             "SUMMARY:%s" % _ics_escape(event.get("title") or "(no title)")]
+    if allday:
+        lines.append("DTSTART;VALUE=DATE:%s" % start.strftime("%Y%m%d"))
+        lines.append("DTEND;VALUE=DATE:%s" % end.strftime("%Y%m%d"))
+    elif floating:
+        lines.append("DTSTART:%s" % start.strftime("%Y%m%dT%H%M%S"))
+        lines.append("DTEND:%s" % end.strftime("%Y%m%dT%H%M%S"))
+    else:
+        lines.append("DTSTART:%sZ"
+                     % start.astimezone(datetime.timezone.utc).strftime("%Y%m%dT%H%M%S"))
+        lines.append("DTEND:%sZ"
+                     % end.astimezone(datetime.timezone.utc).strftime("%Y%m%dT%H%M%S"))
+    if event.get("status"):
+        lines.append("STATUS:%s" % event["status"])
+    if event.get("rule"):
+        lines.append("RRULE:" + ";".join("%s=%s" % (k, v) for k, v in event["rule"].items()))
+    lines += ["END:VEVENT", "END:VCALENDAR", ""]
+    return "\r\n".join(lines)
+
+
 def dav_put_event(nc, cal_uri, uid, ics, request=dav_request, password=None):
     """PUT one iCalendar object into a CalDAV calendar. True on 200/201/204.
 
@@ -1024,13 +1064,19 @@ def dav_put_event(nc, cal_uri, uid, ics, request=dav_request, password=None):
 
 
 def put_events(config, cal, events, request=dav_request):
-    """Write each event that carries raw iCalendar (ics) into `cal`. Returns the count."""
+    """Write each event into `cal`, synthesising iCalendar when the event lacks one.
+
+    Thunderbird-store events carry structured fields but no raw ``ics`` body, so one
+    is built here; otherwise ``dav_put_event`` refuses the empty body and the write is
+    silently dropped behind a printed plan that still exits 0.
+    """
     nc = config.get("nextcloud")
     if not nc or not cal.get("uri"):
         return 0
     written = 0
     for event in events:
-        if dav_put_event(nc, cal["uri"], event.get("id"), event.get("ics"), request=request):
+        ics = event.get("ics") or event_ics(event)
+        if dav_put_event(nc, cal["uri"], event.get("id"), ics, request=request):
             written += 1
     return written
 
