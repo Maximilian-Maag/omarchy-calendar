@@ -1229,6 +1229,11 @@ def cmd_combine(args, ctx):
     events = []
     with tempfile.TemporaryDirectory() as tmp:
         for c in cals:
+            # a calendar the user disabled must not be mined for events that then get
+            # copied into the default — the same gate `list` applies (a disabled
+            # *default* is still honoured, so it is never skipped).
+            if c["disabled"] and not args.include_disabled and c["id"] != default["id"]:
+                continue
             if c.get("source") == "nextcloud":
                 events.extend(nextcloud_events(c, ctx["config"], days=args.days))
             elif c.get("store"):
@@ -1270,7 +1275,10 @@ def cmd_promote(args, ctx):
     if store:
         with tempfile.TemporaryDirectory() as tmp:
             events.extend(load_events(store, tmp, default["id"]))
-    targets = [c["id"] for c in ctx["calendars"] if c["id"] != default["id"]]
+    # every other calendar, except a disabled one (same gate `list` uses — a disabled
+    # calendar must not be written into unless --include-disabled is given).
+    targets = [c["id"] for c in ctx["calendars"]
+               if c["id"] != default["id"] and not (c["disabled"] and not args.include_disabled)]
     plan = promote_plan(events, default["id"], targets)
     if args.json:
         print(json.dumps({"default": default["id"], "writes": [
@@ -1287,7 +1295,7 @@ def cmd_promote(args, ctx):
         default_events = nextcloud_events(default, ctx["config"], days=args.days)
         written = 0
         for target in ctx["calendars"]:
-            if target["id"] != default["id"] and target.get("source") == "nextcloud":
+            if (target["id"] in targets and target.get("source") == "nextcloud"):
                 written += put_events(ctx["config"], target, default_events)
     else:
         if not _write_ctx(ctx):
@@ -1415,12 +1423,14 @@ def main(argv=None):
     p_comb.add_argument("--apply", action="store_true")
     p_comb.add_argument("--json", action="store_true")
     p_comb.add_argument("--days", type=int, default=3650)
+    p_comb.add_argument("--include-disabled", action="store_true")
     p_comb.set_defaults(func=cmd_combine)
 
     p_prom = sub.add_parser("promote", help="default overwrites the other calendars")
     p_prom.add_argument("--apply", action="store_true")
     p_prom.add_argument("--json", action="store_true")
     p_prom.add_argument("--days", type=int, default=3650)
+    p_prom.add_argument("--include-disabled", action="store_true")
     p_prom.set_defaults(func=cmd_promote)
 
     p_theme = sub.add_parser("theme", help="the applied Omarchy palette")

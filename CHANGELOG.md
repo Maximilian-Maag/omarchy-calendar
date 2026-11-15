@@ -2,6 +2,17 @@
 
 All notable changes to omarchy-calendar are documented here.
 
+## [0.3.4] — 2026-11-15
+
+### Fixed
+- **`combine` and `promote` ignored the `disabled` gate that `list` honoured** (#4).
+  `list` skips a disabled non-default calendar, but `combine` still mined it for events
+  to copy into the default and `promote` still wrote INTO it. Both commands now apply the
+  same rule (`disabled and not include_disabled and id != default_id`), with a new
+  `--include-disabled` opt-in; `promote`'s CalDAV write loop is gated on the filtered
+  target set too. Regression tests drive a synthetic profile whose disabled Archive
+  calendar must not be read from or written to.
+
 ## [0.3.3] — 2026-10-28
 
 ### Fixed

@@ -74,6 +74,33 @@ class CliIntegration(unittest.TestCase):
                                        "--days", "100000").stdout)
         self.assertEqual(data["count"], 3)
 
+    def test_combine_ignores_a_disabled_calendar(self):
+        self.add_disabled_calendar()
+        data = json.loads(self.run_cli("combine", "--json").stdout)
+        self.assertEqual([a["calendar"] for a in data["additions"]], ["uuid-work"])
+
+    def test_combine_include_disabled_reads_the_calendar(self):
+        self.add_disabled_calendar()
+        data = json.loads(self.run_cli("combine", "--json", "--include-disabled").stdout)
+        self.assertEqual({a["calendar"] for a in data["additions"]},
+                         {"uuid-work", "uuid-arch"})
+
+    def test_promote_ignores_a_disabled_calendar(self):
+        self.add_disabled_calendar()
+        data = json.loads(self.run_cli("promote", "--json").stdout)
+        self.assertEqual({w["target"] for w in data["writes"]}, {"uuid-work"})
+
+    def test_promote_apply_does_not_write_into_a_disabled_calendar(self):
+        self.add_disabled_calendar()
+        r = self.run_cli("--force", "promote", "--apply")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        conn = sqlite3.connect(str(self.profile / "calendar-data" / "uuid-arch.sqlite"))
+        try:
+            titles = [row[0] for row in conn.execute("SELECT title FROM cal_events")]
+        finally:
+            conn.close()
+        self.assertEqual(titles, ["Archived event"])
+
     def run_cli(self, *args):
         cmd = [sys.executable, str(CLI), "--profile", str(self.profile),
                "--config", str(self.config), *args]

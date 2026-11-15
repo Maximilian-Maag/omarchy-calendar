@@ -179,5 +179,91 @@ class DefaultConfigRegression(unittest.TestCase):
             self.assertEqual(json.loads(cfg.read_text()), {"default_calendar": "uuid-home"})
 
 
+class DisabledCalendarGateRegression(unittest.TestCase):
+    """BUG: `list` skipped a disabled non-default calendar but `combine` still mined
+    it for events to copy into the default, and `promote` still wrote INTO it — the
+    `disabled` gate was honoured in one command and missed in the other two.
+    """
+
+    def _profile(self, d):
+        from test_unit_calendar import make_full_store
+        profile = pathlib.Path(d) / "profile"
+        (profile / "calendar-data").mkdir(parents=True)
+        (profile / "prefs.js").write_text(
+            'user_pref("calendar.registry.uuid-home.name", "Home");\n'
+            'user_pref("calendar.registry.uuid-home.type", "storage");\n'
+            'user_pref("calendar.registry.uuid-work.name", "Work");\n'
+            'user_pref("calendar.registry.uuid-work.type", "caldav");\n'
+            'user_pref("calendar.registry.uuid-arch.name", "Archive");\n'
+            'user_pref("calendar.registry.uuid-arch.type", "storage");\n'
+            'user_pref("calendar.registry.uuid-arch.disabled", true);\n')
+        make_full_store(profile / "calendar-data" / "local.sqlite", "uuid-home",
+                        [("h1", "Home event")])
+        make_full_store(profile / "calendar-data" / "uuid-work.sqlite", "uuid-work",
+                        [("w1", "Work event")])
+        make_full_store(profile / "calendar-data" / "uuid-arch.sqlite", "uuid-arch",
+                        [("a1", "ARCHIVED event")])
+        cfg = pathlib.Path(d) / "calendar.json"
+        cfg.write_text('{"default_calendar": "uuid-home"}')
+        return profile, cfg
+
+    def _run(self, profile, cfg, *args):
+        return subprocess.run([sys.executable, str(CLI), "--profile", str(profile),
+                               "--config", str(cfg), "--force", *args],
+                              capture_output=True, text=True)
+
+    def _titles(self, path):
+        conn = sqlite3.connect(str(path))
+        try:
+            return [row[0] for row in conn.execute("SELECT title FROM cal_events ORDER BY title")]
+        finally:
+            conn.close()
+
+    def test_combine_does_not_mine_disabled_calendar(self):
+        import json
+        with tempfile.TemporaryDirectory() as d:
+            profile, cfg = self._profile(d)
+            r = self._run(profile, cfg, "combine", "--json")
+            self.assertEqual(r.returncode, 0, r.stderr)
+            cals = [a["calendar"] for a in json.loads(r.stdout)["additions"]]
+            self.assertIn("uuid-work", cals)
+            self.assertNotIn("uuid-arch", cals)
+
+    def test_combine_apply_does_not_copy_disabled_events(self):
+        with tempfile.TemporaryDirectory() as d:
+            profile, cfg = self._profile(d)
+            r = self._run(profile, cfg, "combine", "--apply")
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual(self._titles(profile / "calendar-data" / "local.sqlite"),
+                             ["Home event", "Work event"])
+
+    def test_promote_does_not_target_disabled_calendar(self):
+        import json
+        with tempfile.TemporaryDirectory() as d:
+            profile, cfg = self._profile(d)
+            r = self._run(profile, cfg, "promote", "--json")
+            self.assertEqual(r.returncode, 0, r.stderr)
+            targets = [w["target"] for w in json.loads(r.stdout)["writes"]]
+            self.assertIn("uuid-work", targets)
+            self.assertNotIn("uuid-arch", targets)
+
+    def test_promote_apply_does_not_write_into_disabled_calendar(self):
+        with tempfile.TemporaryDirectory() as d:
+            profile, cfg = self._profile(d)
+            r = self._run(profile, cfg, "promote", "--apply")
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual(self._titles(profile / "calendar-data" / "uuid-arch.sqlite"),
+                             ["ARCHIVED event"])
+
+    def test_include_disabled_opt_in_restores_the_calendar(self):
+        import json
+        with tempfile.TemporaryDirectory() as d:
+            profile, cfg = self._profile(d)
+            r = self._run(profile, cfg, "combine", "--json", "--include-disabled")
+            self.assertEqual(r.returncode, 0, r.stderr)
+            cals = [a["calendar"] for a in json.loads(r.stdout)["additions"]]
+            self.assertIn("uuid-arch", cals)
+
+
 if __name__ == "__main__":
     unittest.main()
