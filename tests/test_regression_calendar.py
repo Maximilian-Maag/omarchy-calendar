@@ -361,5 +361,32 @@ class PutEventsTbStoreRegression(unittest.TestCase):
         self.assertEqual(parsed[0]["title"], "Round trip")
 
 
+class MalformedDtendRegression(unittest.TestCase):
+    """BUG (#8): _events_from_ics unpacked DTEND unconditionally, so an empty,
+    unparsable or out-of-range DTEND in a fetched calendar raised through
+    nextcloud_events into cmd_list/cmd_combine and killed the whole command,
+    instead of skipping the one bad event as the DTSTART path already did.
+    """
+
+    def _ics(self, dtend):
+        return ("BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\n"
+                "UID:u1\r\nSUMMARY:Bad\r\nDTSTART:20260605T090000Z\r\n"
+                "DTEND:%s\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n" % dtend)
+
+    def test_empty_dtend_skips_the_event(self):
+        self.assertEqual(cal._events_from_ics(self._ics(""), "c"), [])
+
+    def test_unparsable_dtend_skips_the_event(self):
+        self.assertEqual(cal._events_from_ics(self._ics("not-a-date"), "c"), [])
+
+    def test_out_of_range_dtend_skips_the_event(self):
+        self.assertEqual(cal._events_from_ics(self._ics("20261301T000000Z"), "c"), [])
+
+    def test_valid_dtend_still_parses(self):
+        evs = cal._events_from_ics(self._ics("20260605T100000Z"), "c")
+        self.assertEqual(len(evs), 1)
+        self.assertEqual(evs[0]["end_usecs"] - evs[0]["start_usecs"], 3600 * USECS)
+
+
 if __name__ == "__main__":
     unittest.main()

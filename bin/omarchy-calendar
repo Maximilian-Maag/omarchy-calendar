@@ -1124,7 +1124,16 @@ def _events_from_ics(data, cal_id):
             continue
         start_dt, allday, floating = start
         if props.get("DTEND"):
-            end_dt, _, _ = ics_datetime(*props["DTEND"][0])
+            # Mirror the DTSTART guard: a fetched calendar can carry an empty,
+            # unparsable or out-of-range DTEND (ics_datetime returns None or raises),
+            # and one bad event must not take down the whole command.
+            try:
+                end = ics_datetime(*props["DTEND"][0])
+            except (TypeError, ValueError):
+                continue
+            if end is None:
+                continue
+            end_dt = end[0]
         elif props.get("DURATION"):
             end_dt = start_dt + _parse_duration(props["DURATION"][0][0])
         else:
