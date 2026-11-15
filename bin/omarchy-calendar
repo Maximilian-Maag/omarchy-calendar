@@ -280,11 +280,18 @@ def until_as_local(value):
     return moment
 
 
-def _weekly_occurrences(start, interval, byday, horizon, limit):
+def _weekly_occurrences(start, interval, byday, horizon, limit, window_start=None):
     out = []
     week_start = start - datetime.timedelta(days=start.weekday())
     days = sorted(WEEKDAYS[d] for d in byday if d in WEEKDAYS) if byday else [start.weekday()]
     step = 0
+    if window_start is not None and window_start > week_start:
+        # Skip whole periods that end before the query window: without this the
+        # MAX_OCCURRENCES cap is spent on ancient history and every recent/upcoming
+        # occurrence of a long-running series is dropped. One period of margin keeps
+        # an occurrence that started just before the window (and still runs) in play.
+        weeks = max(0, ((window_start - week_start).days // 7) // interval - 1)
+        step = weeks
     while len(out) < limit:
         base = week_start + datetime.timedelta(weeks=step * interval)
         if base > horizon:
@@ -299,9 +306,14 @@ def _weekly_occurrences(start, interval, byday, horizon, limit):
     return sorted(out)
 
 
-def _daily_occurrences(start, interval, byday, horizon, limit):
+def _daily_occurrences(start, interval, byday, horizon, limit, window_start=None):
     out = []
     day = start
+    if window_start is not None and window_start > start:
+        # Jump the loop near the window (see _weekly_occurrences); one period of
+        # margin is kept so an occurrence straddling the window start is not lost.
+        steps = max(0, (window_start - start).days // interval - 1)
+        day = start + datetime.timedelta(days=steps * interval)
     while day <= horizon and len(out) < limit:
         if not byday or day.weekday() in [WEEKDAYS[d] for d in byday if d in WEEKDAYS]:
             out.append(day)
@@ -354,9 +366,14 @@ def _monthly_day_set(year, month, bymonthday, byday):
     return selected
 
 
-def _monthly_occurrences(start, interval, bymonthday, horizon, limit, byday=()):
+def _monthly_occurrences(start, interval, bymonthday, horizon, limit, byday=(), window_start=None):
     out = []
     year, month, step = start.year, start.month, 0
+    if window_start is not None and window_start > start:
+        # Jump near the window (see _weekly_occurrences) so a long-running series is
+        # not exhausted by the MAX_OCCURRENCES cap before the query window.
+        months = (window_start.year - start.year) * 12 + (window_start.month - start.month)
+        step = max(0, months // interval - 1)
     while len(out) < limit:
         y = year + (month - 1 + step * interval) // 12
         m = (month - 1 + step * interval) % 12 + 1
@@ -379,9 +396,12 @@ def _monthly_occurrences(start, interval, bymonthday, horizon, limit, byday=()):
     return sorted(out)
 
 
-def _yearly_occurrences(start, interval, horizon, limit):
+def _yearly_occurrences(start, interval, horizon, limit, window_start=None):
     out = []
     year = start.year
+    if window_start is not None and window_start > start:
+        # Jump near the window (see _weekly_occurrences).
+        year = start.year + max(0, (window_start.year - start.year) // interval - 1) * interval
     while len(out) < limit:
         try:
             occ = start.replace(year=year)
@@ -396,7 +416,7 @@ def _yearly_occurrences(start, interval, horizon, limit):
     return out
 
 
-def expand_occurrences(start, rule, horizon, limit=MAX_OCCURRENCES):
+def expand_occurrences(start, rule, horizon, limit=MAX_OCCURRENCES, window_start=None):
     if not rule:
         return [start]
     freq = str(rule.get("FREQ", "")).upper()
@@ -411,23 +431,34 @@ def expand_occurrences(start, rule, horizon, limit=MAX_OCCURRENCES):
         if raw.lstrip("-").isdigit():
             bymonthday.append(int(raw))
 
+    # A COUNT-bounded series has exactly COUNT occurrences from the master, so a
+    # whole-series expansion is the correct thing to truncate; only an unbounded
+    # series needs the window jump (a COUNT series is either short, or we raise the
+    # cap to COUNT so the run cannot stop before its tail).
+    count = rule.get("COUNT")
+    bounded = None
+    if count is not None:
+        try:
+            bounded = max(0, int(count))
+        except (TypeError, ValueError):
+            bounded = None
+    if bounded is not None and bounded > limit:
+        limit = bounded
+    jump = window_start if bounded is None else None
+
     if freq == "DAILY":
-        found = _daily_occurrences(start, interval, byday, horizon, limit)
+        found = _daily_occurrences(start, interval, byday, horizon, limit, jump)
     elif freq == "WEEKLY":
-        found = _weekly_occurrences(start, interval, byday, horizon, limit)
+        found = _weekly_occurrences(start, interval, byday, horizon, limit, jump)
     elif freq == "MONTHLY":
-        found = _monthly_occurrences(start, interval, bymonthday, horizon, limit, byday)
+        found = _monthly_occurrences(start, interval, bymonthday, horizon, limit, byday, jump)
     elif freq == "YEARLY":
-        found = _yearly_occurrences(start, interval, horizon, limit)
+        found = _yearly_occurrences(start, interval, horizon, limit, jump)
     else:
         return []
 
-    count = rule.get("COUNT")
-    if count is not None:
-        try:
-            found = found[:max(0, int(count))]
-        except (TypeError, ValueError):
-            pass
+    if bounded is not None:
+        found = found[:bounded]
     raw_until = rule.get("UNTIL")
     if raw_until is not None:
         until = until_as_local(raw_until)
@@ -508,7 +539,7 @@ def load_events(db_path, workdir, cal_id=None):
     return list(masters.values()) + exceptions
 
 
-def occurrences_of(event, horizon, limit=MAX_OCCURRENCES):
+def occurrences_of(event, horizon, limit=MAX_OCCURRENCES, window_start=None):
     allday = event.get("allday", False)
     floating = event.get("floating", False)
     master_start = to_display(event["start_usecs"], allday, floating)
@@ -518,7 +549,7 @@ def occurrences_of(event, horizon, limit=MAX_OCCURRENCES):
     rule = event.get("rule")
     if not rule:
         return [(master_start, master_start + duration)]
-    starts = expand_occurrences(master_start, rule, horizon, limit)
+    starts = expand_occurrences(master_start, rule, horizon, limit, window_start)
     if not starts:
         return [(master_start, master_start + duration)]
     excluded = set(event.get("exceptions") or ()) | set(event.get("exdate") or ())
@@ -696,7 +727,7 @@ def upcoming(events, now=None, days=7):
     for event in events:
         if event["status"].upper() == "CANCELLED":
             continue
-        for start, end in occurrences_of(event, horizon):
+        for start, end in occurrences_of(event, horizon, window_start=now):
             if end.timestamp() >= now_epoch and start.timestamp() <= horizon_epoch:
                 entry = dict(event)
                 allday = event.get("allday", False)

@@ -103,6 +103,62 @@ class StoreBindingRegression(unittest.TestCase):
             self.assertEqual(cals[0]["store"].name, "local.sqlite")
 
 
+class ExpansionWindowRegression(unittest.TestCase):
+    """BUG (#7): expansion started at the master DTSTART and stopped at
+    MAX_OCCURRENCES, so for a long-running series the cap was spent years before the
+    query window and every recent/upcoming occurrence was silently dropped.
+    """
+
+    def _event(self, now, freq, age, ahead_days=7, **rule):
+        us = int(age.timestamp()) * USECS
+        return {"id": "e", "calendar": "c", "title": "series", "start_usecs": us,
+                "end_usecs": us + 3600 * USECS, "status": "", "allday": False,
+                "floating": False, "rule": {"FREQ": freq, **rule},
+                "exdate": set(), "rdate": [], "exceptions": set()}
+
+    def test_long_running_daily_series_has_an_occurrence_in_the_next_7_days(self):
+        now = datetime.datetime(2026, 11, 15, 12, 0)
+        event = self._event(now, "DAILY", now - datetime.timedelta(days=1095))
+        horizon = now + datetime.timedelta(days=7)
+        occ = cal.occurrences_of(event, horizon, window_start=now)
+        self.assertTrue(occ, "a 3-year-old daily series dropped every upcoming occurrence")
+        self.assertTrue(any(now <= s <= horizon for s, _ in occ))
+        self.assertTrue(cal.upcoming([event], now=now, days=7))
+
+    def test_long_running_weekly_series_has_an_occurrence_in_the_next_7_days(self):
+        now = datetime.datetime(2026, 11, 15, 12, 0)
+        event = self._event(now, "WEEKLY", now - datetime.timedelta(weeks=700))
+        horizon = now + datetime.timedelta(days=7)
+        occ = cal.occurrences_of(event, horizon, window_start=now)
+        self.assertTrue(occ)
+        self.assertTrue(any(now <= s <= horizon for s, _ in occ))
+
+    def test_long_running_monthly_series_has_an_occurrence_in_the_next_month(self):
+        now = datetime.datetime(2026, 11, 15, 12, 0)
+        event = self._event(now, "MONTHLY", now - datetime.timedelta(days=365 * 600))
+        horizon = now + datetime.timedelta(days=40)
+        occ = cal.occurrences_of(event, horizon, window_start=now)
+        self.assertTrue(occ)
+        self.assertTrue(any(now <= s <= horizon for s, _ in occ))
+
+    def test_long_running_yearly_series_has_an_occurrence_in_the_next_year(self):
+        now = datetime.datetime(2026, 11, 15, 12, 0)
+        event = self._event(now, "YEARLY", now - datetime.timedelta(days=365 * 600))
+        horizon = now + datetime.timedelta(days=400)
+        occ = cal.occurrences_of(event, horizon, window_start=now)
+        self.assertTrue(occ)
+        self.assertTrue(any(now <= s <= horizon for s, _ in occ))
+
+    def test_bounded_count_series_is_still_expanded_from_its_start(self):
+        # a COUNT-bounded series must keep its own first occurrences: the window jump
+        # only applies to unbounded series.
+        start = datetime.datetime(2026, 1, 1, 9, 0)
+        occ = cal.expand_occurrences(start, {"FREQ": "DAILY", "COUNT": "3"},
+                                     datetime.datetime(2026, 6, 1),
+                                     window_start=datetime.datetime(2026, 5, 1))
+        self.assertEqual([o.day for o in occ], [1, 2, 3])
+
+
 class DedupeRegression(unittest.TestCase):
     """BUG: event identity included the calendar, so the same event copied into the
     default never deduplicated against its copy elsewhere.

@@ -696,6 +696,31 @@ class OccurrenceBoundaryTests(unittest.TestCase):
                                      datetime.datetime(2026, 6, 1))
         self.assertEqual([o.day for o in occ], [1, 2, 3])
 
+    def test_daily_window_jump_starts_near_the_window(self):
+        # a long-running series must not spend the cap on ancient history: the jump
+        # lands one period before the window, not years before it.
+        start = datetime.datetime(2026, 1, 1, 9, 0)
+        window = datetime.datetime(2026, 12, 1, 9, 0)
+        occ = cal._daily_occurrences(start, 2, [], datetime.datetime(2027, 3, 1, 9, 0), 5, window)
+        self.assertGreaterEqual(occ[0], window - datetime.timedelta(days=2))
+        self.assertLessEqual(occ[0], window)
+        self.assertEqual(len(occ), 5)
+
+    def test_weekly_window_jump_starts_near_the_window(self):
+        start = datetime.datetime(2026, 1, 5, 9, 0)          # Monday
+        window = datetime.datetime(2028, 6, 1, 9, 0)
+        occ = cal._weekly_occurrences(start, 1, [], datetime.datetime(2028, 9, 1, 9, 0), 5, window)
+        self.assertGreaterEqual(occ[0], window - datetime.timedelta(weeks=3))
+        self.assertTrue(any(o >= window for o in occ))
+        self.assertEqual(len(occ), 5)
+
+    def test_yearly_window_jump_starts_near_the_window(self):
+        start = datetime.datetime(2026, 3, 1, 9, 0)
+        window = datetime.datetime(2226, 1, 1, 9, 0)
+        occ = cal._yearly_occurrences(start, 1, datetime.datetime(2228, 1, 1, 9, 0), 3, window)
+        self.assertEqual(occ[0].year, 2026 + 199)            # one year before the window
+        self.assertEqual(len(occ), 3)
+
     def test_monthly_horizon_before_first_returns_empty(self):
         start = datetime.datetime(2026, 6, 15, 9, 0)
         occ = cal._monthly_occurrences(start, 1, [], datetime.datetime(2026, 1, 1), 100)
