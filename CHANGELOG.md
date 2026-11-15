@@ -2,6 +2,19 @@
 
 All notable changes to omarchy-calendar are documented here.
 
+## [0.3.6] — 2026-11-15
+
+### Added
+- **`install.sh --uninstall` takes back exactly what the install added** (#9). `install.sh`
+  persists changes — a `/usr/local/bin` symlink, the theme-set hook, a `calendar-bindings.lua`
+  fragment and a `require` block appended to `hyprland.lua` — with no way to reverse them.
+  `--uninstall` now removes each one, and only its own: the CLI symlink goes only when it points
+  into this checkout, the require line is removed by exact content together with its
+  `-- omarchy-calendar keybindings` marker and the blank line above it (never `sed -i`), and the
+  CLI's own data is left untouched. New `tests/shell/test_uninstall.sh` proves the install/uninstall
+  round trip leaves the user's `hyprland.lua` byte-identical (sha256), that a hand-added require line
+  is not eaten, and that a foreign file or symlink is left alone and reported.
+
 ## [0.3.5] — 2026-11-15
 
 ### Fixed
